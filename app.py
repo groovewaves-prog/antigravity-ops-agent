@@ -154,9 +154,14 @@ else:
                     st.write("Connecting to Cisco Sandbox...")
                     res = run_diagnostic_commands()
                     st.session_state.live_result = res
-                    if res["status"] == "SUCCESS": status.update(label="Complete!", state="complete")
-                    else: status.update(label="Failed", state="error")
-        
+                    
+                    if res["status"] == "SUCCESS":
+                        status.update(label="Complete!", state="complete")
+                    else:
+                        # エラー時
+                        status.update(label="Failed", state="error")
+                        # ★ここを追加：詳細なエラー内容を赤字で表示
+                        st.error(f"詳細エラー: {res['error']}")        
         if st.session_state.live_result and st.session_state.live_result["status"] == "SUCCESS":
             with st.expander("取得ログ (Sanitized)", expanded=True):
                 st.code(st.session_state.live_result["sanitized_log"])
