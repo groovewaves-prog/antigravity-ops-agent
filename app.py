@@ -7,9 +7,10 @@ from data import TOPOLOGY
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import run_diagnostic_simulation
 
+# --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
 
-# --- 関数: トポロジー図 ---
+# --- 関数: トポロジー図の生成 ---
 def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
@@ -18,7 +19,7 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     alarmed_ids = {a.device_id for a in alarms}
     
     for node_id, node in TOPOLOGY.items():
-        color = "#e8f5e9"
+        color = "#e8f5e9" # Default Green
         penwidth = "1"
         fontcolor = "black"
         label = f"{node_id}\n({node.type})"
@@ -27,38 +28,46 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         if node.internal_redundancy:
             label += f"\n[{node.internal_redundancy} Redundancy]"
 
+        # 根本原因の強調
         if root_cause_node and node_id == root_cause_node.id:
             if root_severity == "CRITICAL":
-                color = "#ffcdd2"
+                color = "#ffcdd2" # Red
             elif root_severity == "WARNING":
-                color = "#fff9c4"
+                color = "#fff9c4" # Yellow
             else:
                 color = "#e8f5e9"
+            
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
+            
         elif node_id in alarmed_ids:
-            color = "#fff9c4"
+            color = "#fff9c4" # 連鎖アラーム
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
     for node_id, node in TOPOLOGY.items():
         if node.parent_id:
             graph.edge(node.parent_id, node_id)
-            parent = TOPOLOGY.get(node.parent_id)
-            if parent and parent.redundancy_group:
-                partners = [n.id for n in TOPOLOGY.values() if n.redundancy_group == parent.redundancy_group and n.id != parent.id]
-                for p in partners: graph.edge(p, node_id)
+            parent_node = TOPOLOGY.get(node.parent_id)
+            if parent_node and parent_node.redundancy_group:
+                partners = [n.id for n in TOPOLOGY.values() 
+                           if n.redundancy_group == parent_node.redundancy_group and n.id != parent_node.id]
+                for partner_id in partners:
+                    graph.edge(partner_id, node_id)
     return graph
 
-# --- Config読み込み ---
+# --- 関数: Config自動読み込み (修正済み) ---
 def load_config_by_id(device_id):
     path = f"configs/{device_id}.txt"
     if os.path.exists(path):
-        try: with open(path, "r", encoding="utf-8") as f: return f.read()
-        except: return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return None
     return None
 
-# --- UI ---
+# --- UI構築 ---
 st.title("⚡ Antigravity AI Agent (Live Demo)")
 
 api_key = None
@@ -67,10 +76,11 @@ if "GOOGLE_API_KEY" in st.secrets:
 else:
     api_key = os.environ.get("GOOGLE_API_KEY")
 
+# --- サイドバー (カテゴリ分けUI) ---
 with st.sidebar:
     st.header("⚡ 運用モード選択")
     
-    # 電源障害（片系/両系）を追加した新しいシナリオリスト
+    # シナリオ定義
     SCENARIO_MAP = {
         "基本・広域障害": [
             "正常稼働",
@@ -113,6 +123,7 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
+# セッション状態管理
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
     st.session_state.messages = []
@@ -120,6 +131,7 @@ if "current_scenario" not in st.session_state:
     st.session_state.live_result = None
     st.session_state.trigger_analysis = False
 
+# シナリオ変更時のリセット処理
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []
@@ -128,7 +140,7 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.rerun()
 
-# --- アラーム生成ロジック (電源冗長対応) ---
+# --- アラーム生成 (ロジック) ---
 alarms = []
 root_severity = "CRITICAL"
 
@@ -178,8 +190,8 @@ if alarms:
     inference_result = engine.analyze_alarms(alarms)
     root_cause = inference_result.root_cause_node
     reason = inference_result.root_cause_reason
+    
     # エンジン判定が優先だが、シミュレーション側の意図(root_severity)も考慮
-    # (ロジック側で単体Warning判定が出ればそれが採用される)
     if inference_result.severity == "CRITICAL":
         root_severity = "CRITICAL"
     elif inference_result.severity == "WARNING":
@@ -188,6 +200,7 @@ if alarms:
 # --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
 
+# 左カラム
 with col1:
     st.subheader("Network Status")
     st.graphviz_chart(render_topology(alarms, root_cause, root_severity), use_container_width=True)
@@ -197,20 +210,27 @@ with col1:
             st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
         else:
             st.markdown(f'<div style="color:#856404;background:#fff3cd;padding:10px;border-radius:5px;">⚠️ 警告：{root_cause.id} 異常検知 (稼働中)</div>', unsafe_allow_html=True)
+        
         st.caption(f"理由: {reason}")
     
     is_live_mode = ("[Live]" in selected_scenario)
+    
     if is_live_mode or root_cause:
         st.markdown("---")
         st.info("🛠 **自律調査エージェント**")
+        
         if st.button("🚀 診断実行 (Auto-Diagnostic)", type="primary"):
             if not api_key:
                 st.error("API Key Required")
             else:
                 with st.status("Agent Operating...", expanded=True) as status:
                     st.write("🔌 Executing Diagnostics...")
+                    
+                    # APIキーを渡してAIログ生成を実行
                     res = run_diagnostic_simulation(selected_scenario, api_key)
+                    
                     st.session_state.live_result = res
+                    
                     if res["status"] == "SUCCESS":
                         st.write("✅ Data Acquired.")
                         st.write("🧹 Sanitizing...")
@@ -221,18 +241,20 @@ with col1:
                     else:
                         st.write("❌ Check Failed.")
                         status.update(label="Target Unreachable", state="error", expanded=False)
+                    
                     st.session_state.trigger_analysis = True
                     st.rerun()
 
         if st.session_state.live_result:
             res = st.session_state.live_result
             if res["status"] == "SUCCESS":
-                st.success("🛡️ **Data Sanitized**: 機密情報はマスク処理済み")
+                st.success("🛡️ **Data Sanitized**: パスワード・IPアドレスをマスク処理しました。")
                 with st.expander("📄 取得ログ (Sanitized)", expanded=True):
                     st.code(res["sanitized_log"], language="text")
             elif res["status"] == "ERROR":
                 st.error(f"診断結果: {res['error']}")
 
+# 右カラム
 with col2:
     st.subheader("AI Analyst Report")
     if not api_key: st.stop()
@@ -265,17 +287,27 @@ with col2:
     if st.session_state.trigger_analysis and st.session_state.chat_session:
         live_data = st.session_state.live_result
         log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
+        
         prompt = f"""
-        診断コマンドを実行しました。結果に基づき『ネクストアクション実行レポート』を作成してください。
-        【診断データ】ステータス: {live_data['status']}, ログ: {log_content}
-        【出力要件】1.接続結果, 2.ログ分析, 3.推奨アクション
+        診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
+        
+        【診断データ】
+        ステータス: {live_data['status']}
+        ログ: {log_content}
+        
+        【出力要件】
+        1. 接続結果 (成功/失敗)
+        2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
+        3. 推奨アクション (交換、再起動、静観など)
         """
         st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
+        
         with st.spinner("Analyzing Diagnostic Data..."):
             try:
                 res = st.session_state.chat_session.send_message(prompt)
                 st.session_state.messages.append({"role": "assistant", "content": res.text})
             except Exception as e: st.error(str(e))
+        
         st.session_state.trigger_analysis = False
         st.rerun()
 
