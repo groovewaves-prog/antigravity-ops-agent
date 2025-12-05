@@ -10,13 +10,15 @@ from network_ops import run_diagnostic_simulation
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
 
-# --- 関数: トポロジー図の生成 ---
+# --- 関数: トポロジー図の生成 (修正版) ---
 def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     graph = graphviz.Digraph()
     graph.attr(rankdir='TB')
     graph.attr('node', shape='box', style='rounded,filled', fontname='Helvetica')
     
-    alarmed_ids = {a.device_id for a in alarms}
+    # アラーム辞書（ID -> Alarmオブジェクト）を作成
+    alarm_map = {a.device_id: a for a in alarms}
+    alarmed_ids = set(alarm_map.keys())
     
     for node_id, node in TOPOLOGY.items():
         color = "#e8f5e9" # Default Green
@@ -24,24 +26,26 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         fontcolor = "black"
         label = f"{node_id}\n({node.type})"
         
-        # 内部冗長情報があればラベルに追記
         if node.internal_redundancy:
             label += f"\n[{node.internal_redundancy} Redundancy]"
 
-        # 根本原因の強調
+        # 根本原因ノードの描画
         if root_cause_node and node_id == root_cause_node.id:
-            if root_severity == "CRITICAL":
-                color = "#ffcdd2" # Red
-            elif root_severity == "WARNING":
-                color = "#fff9c4" # Yellow
+            # 【修正】全体判定(root_severity)ではなく、その機器単体のアラーム重要度で色を決める
+            # これにより「HAでシステムはWarningだが、機器自体はCritical(赤)」を表現可能
+            node_severity = alarm_map[node_id].severity if node_id in alarm_map else "CRITICAL"
+            
+            if node_severity == "CRITICAL":
+                color = "#ffcdd2" # Red (Down)
             else:
-                color = "#e8f5e9"
+                color = "#fff9c4" # Yellow (Warning)
             
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
             
         elif node_id in alarmed_ids:
-            color = "#fff9c4" # 連鎖アラーム
+            # 連鎖アラーム等は黄色
+            color = "#fff9c4" 
         
         graph.node(node_id, label=label, fillcolor=color, color='black', penwidth=penwidth, fontcolor=fontcolor)
     
@@ -76,7 +80,6 @@ if "GOOGLE_API_KEY" in st.secrets:
 else:
     api_key = os.environ.get("GOOGLE_API_KEY")
 
-# --- サイドバー (カテゴリ分けUI) ---
 with st.sidebar:
     st.header("⚡ 運用モード選択")
     
@@ -122,7 +125,6 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-# セッション状態管理
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
     st.session_state.messages = []
@@ -130,7 +132,6 @@ if "current_scenario" not in st.session_state:
     st.session_state.live_result = None
     st.session_state.trigger_analysis = False
 
-# シナリオ変更時のリセット処理
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []
@@ -139,19 +140,20 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.rerun()
 
-# --- アラーム生成 (ロジック) ---
+# --- アラーム生成 (シミュレーション) ---
 alarms = []
-root_severity = "CRITICAL"
+root_severity = "CRITICAL" # ロジック判定前のデフォルト
 
+# 1. 広域障害
 if "WAN全回線断" in selected_scenario:
     alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
 elif "FW片系障害" in selected_scenario:
+    # 従来シナリオ互換
     alarms = [Alarm("FW_01_PRIMARY", "Heartbeat Loss", "WARNING")]
-    root_severity = "WARNING"
 elif "L2SWサイレント障害" in selected_scenario:
     alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
 
-# === 個別障害ロジック ===
+# 2. 個別機器障害
 else:
     target_device = None
     if "[WAN]" in selected_scenario: target_device = "WAN_ROUTER_01"
@@ -161,21 +163,21 @@ else:
     if target_device:
         # 電源障害
         if "電源障害：片系" in selected_scenario:
+            # 片系ダウン -> 稼働継続 -> アラームはWarning
             alarms = [Alarm(target_device, "Power Supply 1 Failed", "WARNING")]
-            root_severity = "WARNING"
         elif "電源障害：両系" in selected_scenario:
-            alarms = simulate_cascade_failure(target_device, TOPOLOGY)
-            root_severity = "CRITICAL"
+            # 両系ダウン -> 機器停止 -> アラームはCritical
+            # ※HA構成の場合、配下への波及はない（Secondaryが生きているため）ので
+            #   simulate_cascade_failure は使わず、単体Criticalアラームとする
+            alarms = [Alarm(target_device, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
+        
         # その他
         elif "BGP" in selected_scenario:
             alarms = [Alarm(target_device, "BGP Flapping", "WARNING")]
-            root_severity = "WARNING"
         elif "FAN" in selected_scenario:
             alarms = [Alarm(target_device, "Fan Fail", "WARNING")]
-            root_severity = "WARNING"
         elif "メモリ" in selected_scenario:
             alarms = [Alarm(target_device, "Memory High", "WARNING")]
-            root_severity = "WARNING"
 
 root_cause = None
 inference_result = None
@@ -186,11 +188,8 @@ if alarms:
     inference_result = engine.analyze_alarms(alarms)
     root_cause = inference_result.root_cause_node
     reason = inference_result.root_cause_reason
-    
-    if inference_result.severity == "CRITICAL":
-        root_severity = "CRITICAL"
-    elif inference_result.severity == "WARNING":
-        root_severity = "WARNING"
+    # エンジンの総合判定を採用 (HAで耐えていればWARNINGになる)
+    root_severity = inference_result.severity
 
 # --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
@@ -198,18 +197,20 @@ col1, col2 = st.columns([1, 1])
 # 左カラム
 with col1:
     st.subheader("Network Status")
+    # 描画関数にはエンジン判定(root_severity)を渡すが、関数内部でアラーム個別のSeverityを優先して色を塗る
     st.graphviz_chart(render_topology(alarms, root_cause, root_severity), use_container_width=True)
     
     if root_cause:
+        # メッセージボックスは「システム全体への影響度(root_severity)」で表示する
         if root_severity == "CRITICAL":
             st.markdown(f'<div style="color:#d32f2f;background:#fdecea;padding:10px;border-radius:5px;">🚨 緊急アラート：{root_cause.id} ダウン</div>', unsafe_allow_html=True)
         else:
+            # HAで耐えている場合はこちら
             st.markdown(f'<div style="color:#856404;background:#fff3cd;padding:10px;border-radius:5px;">⚠️ 警告：{root_cause.id} 異常検知 (稼働中)</div>', unsafe_allow_html=True)
         
         st.caption(f"理由: {reason}")
     
     is_live_mode = ("[Live]" in selected_scenario)
-    
     if is_live_mode or root_cause:
         st.markdown("---")
         st.info("🛠 **自律調査エージェント**")
@@ -220,11 +221,8 @@ with col1:
             else:
                 with st.status("Agent Operating...", expanded=True) as status:
                     st.write("🔌 Executing Diagnostics...")
-                    
                     res = run_diagnostic_simulation(selected_scenario, api_key)
-                    
                     st.session_state.live_result = res
-                    
                     if res["status"] == "SUCCESS":
                         st.write("✅ Data Acquired.")
                         st.write("🧹 Sanitizing...")
@@ -235,7 +233,6 @@ with col1:
                     else:
                         st.write("❌ Check Failed.")
                         status.update(label="Target Unreachable", state="error", expanded=False)
-                    
                     st.session_state.trigger_analysis = True
                     st.rerun()
 
@@ -280,8 +277,6 @@ with col2:
     if st.session_state.trigger_analysis and st.session_state.chat_session:
         live_data = st.session_state.live_result
         log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
-        
-        # 【修正】AIへの指示を「正直に答える」ように変更
         prompt = f"""
         診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
         
@@ -290,21 +285,17 @@ with col2:
         ログ: {log_content}
         
         【出力要件】
-        0. **診断結論:**
-           - ログから原因が明確に特定できる場合: その原因を断定的に記述。
-           - ログから原因が特定できない場合(曖昧な場合): 「現時点のログでは真因の特定に至らず」と明記し、可能性のある要因を挙げるに留めること。無理に原因を捏造しないこと。
+        0. **診断結論 (最重要):** ログ分析から特定された障害原因を簡潔に（例：電源モジュールAの故障）
         1. 接続結果 (成功/失敗)
         2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
-        3. 推奨アクション (真因が不明な場合は、詳細調査のための追加コマンドやベンダー問い合わせを推奨する)
+        3. 推奨アクション (交換、再起動、静観など)
         """
         st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
-        
         with st.spinner("Analyzing Diagnostic Data..."):
             try:
                 res = st.session_state.chat_session.send_message(prompt)
                 st.session_state.messages.append({"role": "assistant", "content": res.text})
             except Exception as e: st.error(str(e))
-        
         st.session_state.trigger_analysis = False
         st.rerun()
 
