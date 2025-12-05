@@ -24,8 +24,8 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
         fontcolor = "black"
         label = f"{node_id}\n({node.type})"
         
-        # ★変更: metadata内の情報をラベルに付加
-        # "redundancy_type" というキーがあれば表示 (例: [PSU Redundancy])
+        # メタデータ(旧internal_redundancy等)の表示
+        # data.pyの修正により node.metadata 辞書を参照
         red_type = node.metadata.get("redundancy_type")
         if red_type:
             label += f"\n[{red_type} Redundancy]"
@@ -58,8 +58,16 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
                     graph.edge(partner_id, node_id)
     return graph
 
-# --- (以下、Config読み込み、UI構築、サイドバーなどは変更なし) ---
-# ... (中略) ...
+# --- 関数: Config自動読み込み (ここが重要: 呼び出しより前に定義) ---
+def load_config_by_id(device_id):
+    path = f"configs/{device_id}.txt"
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return None
+    return None
 
 # --- UI構築 ---
 st.title("⚡ Antigravity AI Agent (Live Demo)")
@@ -70,10 +78,10 @@ if "GOOGLE_API_KEY" in st.secrets:
 else:
     api_key = os.environ.get("GOOGLE_API_KEY")
 
+# --- サイドバー (カテゴリ分けUI) ---
 with st.sidebar:
     st.header("⚡ 運用モード選択")
     
-    # シナリオ定義
     SCENARIO_MAP = {
         "基本・広域障害": [
             "正常稼働",
@@ -116,10 +124,7 @@ with st.sidebar:
         user_key = st.text_input("Google API Key", type="password")
         if user_key: api_key = user_key
 
-if "---" in selected_scenario:
-    st.warning("カテゴリ見出しです。具体的なシナリオを選択してください。")
-    st.stop()
-
+# セッション状態管理
 if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
     st.session_state.messages = []
@@ -127,6 +132,7 @@ if "current_scenario" not in st.session_state:
     st.session_state.live_result = None
     st.session_state.trigger_analysis = False
 
+# シナリオ変更時のリセット処理
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
     st.session_state.messages = []
@@ -163,10 +169,10 @@ else:
         elif "電源障害：両系" in selected_scenario:
             # 両系ダウン -> 機器停止 -> Critical
             if target_device == "FW_01_PRIMARY":
-                # FWはHAがあるので配下への波及はさせない（シミュレーション仕様）
+                # FWはHA構成なので配下への波及はさせず単体停止
                 alarms = [Alarm(target_device, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
             else:
-                # WANやSwitchは波及させる
+                # WANやL2SWはSPOFなので波及させる
                 alarms = simulate_cascade_failure(target_device, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
             root_severity = "CRITICAL"
         
@@ -191,7 +197,7 @@ if alarms:
     root_cause = inference_result.root_cause_node
     reason = inference_result.root_cause_reason
     
-    # エンジン判定が優先
+    # エンジン判定が優先だが、シミュレーション側の意図(root_severity)も考慮
     if inference_result.severity == "CRITICAL":
         root_severity = "CRITICAL"
     elif inference_result.severity == "WARNING":
@@ -200,6 +206,7 @@ if alarms:
 # --- メイン画面 ---
 col1, col2 = st.columns([1, 1])
 
+# 左カラム
 with col1:
     st.subheader("Network Status")
     st.graphviz_chart(render_topology(alarms, root_cause, root_severity), use_container_width=True)
@@ -225,6 +232,7 @@ with col1:
                 with st.status("Agent Operating...", expanded=True) as status:
                     st.write("🔌 Executing Diagnostics...")
                     
+                    # APIキーを渡してAIログ生成を実行
                     res = run_diagnostic_simulation(selected_scenario, api_key)
                     
                     st.session_state.live_result = res
@@ -252,11 +260,13 @@ with col1:
             elif res["status"] == "ERROR":
                 st.error(f"診断結果: {res['error']}")
 
+# 右カラム
 with col2:
     st.subheader("AI Analyst Report")
     if not api_key: st.stop()
 
     should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
+    
     if should_start_chat:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature": 0.0})
@@ -267,6 +277,7 @@ with col2:
             log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
             system_prompt = f"診断結果に基づきレポートを作成せよ。\nステータス: {live_data['status']}\nログ: {log_content}"
         elif root_cause:
+            # 修正: ここで load_config_by_id を呼び出します
             conf = load_config_by_id(root_cause.id)
             system_prompt = f"障害報告: {root_cause.id} ({root_cause.type})\n理由: {reason}\n重要度: {root_severity}"
             if conf: system_prompt += f"\nConfig:\n{conf}"
