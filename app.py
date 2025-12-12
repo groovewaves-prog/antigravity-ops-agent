@@ -80,12 +80,10 @@ def cleanup_old_messages():
     valid_msgs = []
     
     for msg in messages:
-        # システムプロンプト等は残すか、あるいは古すぎるものを消す
         age = now - msg.get("timestamp", 0)
         if age < Config.MAX_MESSAGE_AGE:
             valid_msgs.append(msg)
             
-    # 数が多すぎたら古い順に削除 (システムメッセージは保護するロジックが必要だが簡易的に)
     if len(valid_msgs) > Config.MAX_MESSAGES:
         valid_msgs = valid_msgs[-Config.MAX_MESSAGES:]
         
@@ -108,10 +106,9 @@ def load_config_by_id(device_id):
     config_dir = "configs"
     if not os.path.exists(config_dir): return None
     
-    safe_id = os.path.basename(device_id) # パストラバーサル対策
+    safe_id = os.path.basename(device_id)
     path = os.path.join(config_dir, f"{safe_id}.txt")
     
-    # ディレクトリ外脱出チェック
     if not os.path.abspath(path).startswith(os.path.abspath(config_dir)):
         return None
         
@@ -228,7 +225,6 @@ if app_mode == "🚨 障害対応":
     root_severity = "CRITICAL"
     target_device_id = None
 
-    # (シナリオ分岐ロジックは既存と同じ)
     if "WAN全回線断" in selected_scenario:
         target_device_id = "WAN_ROUTER_01"
         alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
@@ -405,4 +401,47 @@ if app_mode == "🚨 障害対応":
                             try:
                                 resp = send_message_with_retry(st.session_state.chat_session, prompt)
                                 add_message("assistant", resp)
-                                st.markd
+                                st.markdown(resp)
+                            except Exception as e: st.error(str(e))
+
+# -----------------------------------------------------
+# モードB: 設定生成
+# -----------------------------------------------------
+elif app_mode == "🔧 設定生成":
+    st.subheader("🔧 Intent-Based Config Generator")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.info("自然言語の指示(Intent)から、メーカー仕様に合わせたConfigを自動生成します。")
+        tid = st.selectbox("対象機器:", list(TOPOLOGY.keys()))
+        tnode = TOPOLOGY[tid]
+        st.caption(f"Device: {tnode.metadata.get('vendor')} / {tnode.metadata.get('os')}")
+        
+        cconf = load_config_by_id(tid)
+        with st.expander("現在のConfig"):
+            st.code(cconf if cconf else "(No current config)")
+        
+        intent = st.text_area("Intent:", height=150, placeholder="例: Gi0/1にVLAN100を割り当てて。")
+        if st.button("✨ Config生成", type="primary"):
+            if not api_key or not intent: st.error("Missing Info")
+            else:
+                with st.spinner("Generating..."):
+                    try:
+                        gconf = generate_config_from_intent(tnode, cconf, intent, api_key)
+                        st.session_state.generated_conf = gconf
+                    except Exception as e: st.error(str(e))
+    with c2:
+        st.subheader("📝 Generated Config")
+        if "generated_conf" in st.session_state:
+            st.markdown(st.session_state.generated_conf)
+            st.success("生成完了")
+        
+        st.markdown("---")
+        st.subheader("🔍 Health Check")
+        if st.button("正常性確認コマンド生成"):
+             if not api_key: st.error("API Key Required")
+             else:
+                 with st.spinner("Generating..."):
+                     try:
+                         cmds = generate_health_check_commands(tnode, api_key)
+                         st.code(cmds)
+                     except Exception as e: st.error(str(e))
