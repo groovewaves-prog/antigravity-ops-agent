@@ -39,10 +39,8 @@ def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
                 color = "#fff9c4" # Yellow
             else:
                 color = "#e8f5e9"
-            
             penwidth = "3"
             label += "\n[ROOT CAUSE]"
-            
         elif node_id in alarmed_ids:
             color = "#fff9c4" # 連鎖アラーム
         
@@ -134,40 +132,47 @@ if app_mode == "🚨 障害対応":
         st.session_state.trigger_analysis = False
         st.rerun()
 
+    # --- アラーム生成 & ターゲット特定 ---
     alarms = []
     root_severity = "CRITICAL"
+    target_device_id = None # シミュレーション対象のID
 
+    # 1. 広域シナリオ
     if "WAN全回線断" in selected_scenario:
+        target_device_id = "WAN_ROUTER_01"
         alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
     elif "FW片系障害" in selected_scenario:
+        target_device_id = "FW_01_PRIMARY"
         alarms = [Alarm("FW_01_PRIMARY", "Heartbeat Loss", "WARNING")]
         root_severity = "WARNING"
     elif "L2SWサイレント障害" in selected_scenario:
+        target_device_id = "L2_SW_01"
         alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
+    
+    # 2. 個別機器シナリオ (文字列からIDをマッピング)
     else:
-        target_device = None
-        if "[WAN]" in selected_scenario: target_device = "WAN_ROUTER_01"
-        elif "[FW]" in selected_scenario: target_device = "FW_01_PRIMARY"
-        elif "[L2SW]" in selected_scenario: target_device = "L2_SW_01"
+        if "[WAN]" in selected_scenario: target_device_id = "WAN_ROUTER_01"
+        elif "[FW]" in selected_scenario: target_device_id = "FW_01_PRIMARY"
+        elif "[L2SW]" in selected_scenario: target_device_id = "L2_SW_01"
 
-        if target_device:
+        if target_device_id:
             if "電源障害：片系" in selected_scenario:
-                alarms = [Alarm(target_device, "Power Supply 1 Failed", "WARNING")]
+                alarms = [Alarm(target_device_id, "Power Supply 1 Failed", "WARNING")]
                 root_severity = "WARNING"
             elif "電源障害：両系" in selected_scenario:
-                if target_device == "FW_01_PRIMARY":
-                    alarms = [Alarm(target_device, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
+                if target_device_id == "FW_01_PRIMARY":
+                    alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
                 else:
-                    alarms = simulate_cascade_failure(target_device, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
+                    alarms = simulate_cascade_failure(target_device_id, TOPOLOGY, "Power Supply: Dual Loss (Device Down)")
                 root_severity = "CRITICAL"
             elif "BGP" in selected_scenario:
-                alarms = [Alarm(target_device, "BGP Flapping", "WARNING")]
+                alarms = [Alarm(target_device_id, "BGP Flapping", "WARNING")]
                 root_severity = "WARNING"
             elif "FAN" in selected_scenario:
-                alarms = [Alarm(target_device, "Fan Fail", "WARNING")]
+                alarms = [Alarm(target_device_id, "Fan Fail", "WARNING")]
                 root_severity = "WARNING"
             elif "メモリ" in selected_scenario:
-                alarms = [Alarm(target_device, "Memory High", "WARNING")]
+                alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
                 root_severity = "WARNING"
 
     root_cause = None
@@ -197,16 +202,22 @@ if app_mode == "🚨 障害対応":
                 st.markdown(f'<div style="color:#856404;background:#fff3cd;padding:10px;border-radius:5px;">⚠️ 警告：{root_cause.id} 異常検知 (稼働中)</div>', unsafe_allow_html=True)
             st.caption(f"理由: {reason}")
         
-        if root_cause or ("[Live]" in selected_scenario):
+        is_live_mode = ("[Live]" in selected_scenario)
+        if is_live_mode or root_cause:
             st.markdown("---")
             st.info("🛠 **自律調査エージェント**")
+            
             if st.button("🚀 診断実行 (Auto-Diagnostic)", type="primary"):
                 if not api_key:
                     st.error("API Key Required")
                 else:
                     with st.status("Agent Operating...", expanded=True) as status:
                         st.write("🔌 Executing Diagnostics...")
-                        res = run_diagnostic_simulation(selected_scenario, api_key)
+                        
+                        # ★変更: シナリオ名だけでなく、ターゲット機器オブジェクトも渡す
+                        target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
+                        res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
+                        
                         st.session_state.live_result = res
                         if res["status"] == "SUCCESS":
                             st.write("✅ Data Acquired.")
@@ -214,7 +225,9 @@ if app_mode == "🚨 障害対応":
                         elif res["status"] == "SKIPPED":
                             status.update(label="Skipped", state="complete")
                         else:
+                            st.write("❌ Check Failed.")
                             status.update(label="Target Unreachable", state="error", expanded=False)
+                        
                         st.session_state.trigger_analysis = True
                         st.rerun()
 
@@ -235,7 +248,7 @@ if app_mode == "🚨 障害対応":
         if should_start_chat:
             genai.configure(api_key=api_key)
             # ★変更: gemini-2.0-flash-lite
-            model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0, "max_output_tokens": 1500})
+            model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0})
             
             system_prompt = ""
             if st.session_state.live_result:
@@ -259,6 +272,7 @@ if app_mode == "🚨 障害対応":
         if st.session_state.trigger_analysis and st.session_state.chat_session:
             live_data = st.session_state.live_result
             log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
+            
             prompt = f"""
             診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
             【診断データ】ステータス: {live_data['status']}, ログ: {log_content}
@@ -303,8 +317,10 @@ elif app_mode == "🔧 設定生成":
         st.info("自然言語の指示(Intent)から、メーカー仕様に合わせたConfigを自動生成します。")
         target_id = st.selectbox("対象機器を選択:", list(TOPOLOGY.keys()))
         target_node = TOPOLOGY[target_id]
+        
         vendor = target_node.metadata.get("vendor", "Unknown")
-        st.caption(f"Device Info: {vendor}")
+        os_type = target_node.metadata.get("os", "Unknown")
+        st.caption(f"Device Info: {vendor} / {os_type}")
         
         current_conf = load_config_by_id(target_id)
         with st.expander("現在のConfigを確認"):
@@ -337,22 +353,3 @@ elif app_mode == "🔧 設定生成":
                  with st.spinner("Generating..."):
                      cmds = generate_health_check_commands(target_node, api_key)
                      st.code(cmds, language="text")
-
-# --- app.py に一時的に追加するコード ---
-
-# サイドバーの一番下に追加すると便利です
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("🛠 モデル確認ツール")
-    if st.button("利用可能なモデルを表示"):
-        if not api_key:
-            st.error("API Keyを入れてください")
-        else:
-            try:
-                genai.configure(api_key=api_key)
-                st.write("▼ 利用可能なモデル一覧")
-                for m in genai.list_models():
-                    if 'generateContent' in m.supported_generation_methods:
-                        st.code(m.name) # 画面に表示
-            except Exception as e:
-                st.error(f"エラー: {e}")
