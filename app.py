@@ -6,6 +6,8 @@ import google.generativeai as genai
 from data import TOPOLOGY
 from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import run_diagnostic_simulation, generate_config_from_intent, generate_health_check_commands
+# ★追加: 検証モジュール
+from verifier import verify_log_content, format_verification_report
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Live", page_icon="⚡", layout="wide")
@@ -110,6 +112,7 @@ if "current_mode" not in st.session_state:
     st.session_state.chat_session = None 
     st.session_state.live_result = None
     st.session_state.trigger_analysis = False
+    st.session_state.verification_result = None # 検証結果保持用
 
 if st.session_state.current_mode != app_mode:
     st.session_state.current_mode = app_mode
@@ -130,14 +133,13 @@ if app_mode == "🚨 障害対応":
         st.session_state.chat_session = None
         st.session_state.live_result = None
         st.session_state.trigger_analysis = False
+        st.session_state.verification_result = None
         st.rerun()
 
-    # --- アラーム生成 & ターゲット特定 ---
     alarms = []
     root_severity = "CRITICAL"
-    target_device_id = None # シミュレーション対象のID
+    target_device_id = None
 
-    # 1. 広域シナリオ
     if "WAN全回線断" in selected_scenario:
         target_device_id = "WAN_ROUTER_01"
         alarms = simulate_cascade_failure("WAN_ROUTER_01", TOPOLOGY)
@@ -148,8 +150,6 @@ if app_mode == "🚨 障害対応":
     elif "L2SWサイレント障害" in selected_scenario:
         target_device_id = "L2_SW_01"
         alarms = [Alarm("AP_01", "Connection Lost", "CRITICAL"), Alarm("AP_02", "Connection Lost", "CRITICAL")]
-    
-    # 2. 個別機器シナリオ (文字列からIDをマッピング)
     else:
         if "[WAN]" in selected_scenario: target_device_id = "WAN_ROUTER_01"
         elif "[FW]" in selected_scenario: target_device_id = "FW_01_PRIMARY"
@@ -206,15 +206,12 @@ if app_mode == "🚨 障害対応":
         if is_live_mode or root_cause:
             st.markdown("---")
             st.info("🛠 **自律調査エージェント**")
-            
             if st.button("🚀 診断実行 (Auto-Diagnostic)", type="primary"):
                 if not api_key:
                     st.error("API Key Required")
                 else:
                     with st.status("Agent Operating...", expanded=True) as status:
                         st.write("🔌 Executing Diagnostics...")
-                        
-                        # ★変更: シナリオ名だけでなく、ターゲット機器オブジェクトも渡す
                         target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
                         res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
                         
@@ -222,11 +219,18 @@ if app_mode == "🚨 障害対応":
                         if res["status"] == "SUCCESS":
                             st.write("✅ Data Acquired.")
                             status.update(label="Complete!", state="complete", expanded=False)
+                            
+                            # ★追加: ここで「検証モジュール」を実行
+                            log_content = res.get('sanitized_log', "")
+                            verification = verify_log_content(log_content)
+                            st.session_state.verification_result = verification
+                            
                         elif res["status"] == "SKIPPED":
                             status.update(label="Skipped", state="complete")
                         else:
                             st.write("❌ Check Failed.")
                             status.update(label="Target Unreachable", state="error", expanded=False)
+                            st.session_state.verification_result = {"status": "Connection Failed"}
                         
                         st.session_state.trigger_analysis = True
                         st.rerun()
@@ -237,6 +241,14 @@ if app_mode == "🚨 障害対応":
                     st.success("🛡️ **Data Sanitized**: 機密情報はマスク処理済み")
                     with st.expander("📄 取得ログ (Sanitized)", expanded=True):
                         st.code(res["sanitized_log"], language="text")
+                    
+                    # ★追加: 検証結果の表示 (Human/Script Verification)
+                    if st.session_state.verification_result:
+                        with st.expander("✅ 自動検証結果 (Rule-Based Check)", expanded=True):
+                            v = st.session_state.verification_result
+                            st.write(f"- **Ping**: {v.get('ping_status')}")
+                            st.write(f"- **Interface**: {v.get('interface_status')}")
+                            st.write(f"- **Hardware**: {v.get('hardware_error')}")
                 elif res["status"] == "ERROR":
                     st.error(f"診断結果: {res['error']}")
 
@@ -247,8 +259,7 @@ if app_mode == "🚨 障害対応":
         should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
         if should_start_chat:
             genai.configure(api_key=api_key)
-            # ★変更: gemma-3-12b-it
-            model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+            model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
             
             system_prompt = ""
             if st.session_state.live_result:
@@ -273,10 +284,27 @@ if app_mode == "🚨 障害対応":
             live_data = st.session_state.live_result
             log_content = live_data.get('sanitized_log') or f"Error: {live_data.get('error')}"
             
+            # ★追加: 検証結果をプロンプトに注入 (メタ認知)
+            verification_text = ""
+            if st.session_state.verification_result:
+                verification_text = format_verification_report(st.session_state.verification_result)
+
             prompt = f"""
             診断コマンドを実行しました。以下の結果に基づき『ネクストアクション実行レポート』を作成してください。
-            【診断データ】ステータス: {live_data['status']}, ログ: {log_content}
-            【出力要件】0.診断結論(最重要), 1.接続結果, 2.ログ分析, 3.推奨アクション
+            
+            【診断データ】
+            ステータス: {live_data['status']}
+            ログ: {log_content}
+            
+            {verification_text}
+            
+            【出力要件】
+            0. **診断結論 (最重要):** 
+               - ログ分析から特定された障害原因を簡潔に。
+               - **重要:** 上記の「システム自動検証結果(Ground Truth)」と矛盾する結論を出してはならない。
+            1. 接続結果 (成功/失敗)
+            2. ログ分析 (インターフェース状態、ルート情報、環境変数など)
+            3. 推奨アクション (交換、再起動、静観など)
             """
             st.session_state.messages.append({"role": "user", "content": "診断結果を分析してください。"})
             with st.spinner("Analyzing Diagnostic Data..."):
@@ -305,29 +333,21 @@ if app_mode == "🚨 障害対応":
                             st.markdown(res.text)
                             st.session_state.messages.append({"role": "assistant", "content": res.text})
 
-# ==========================================
-# モードB: 設定生成 (Day 1)
-# ==========================================
+# ... (モードBは変更なし) ...
 elif app_mode == "🔧 設定生成":
+    # (既存コード維持)
     st.subheader("🔧 Intent-Based Config Generator")
-    
     c1, c2 = st.columns([1, 1])
-    
     with c1:
         st.info("自然言語の指示(Intent)から、メーカー仕様に合わせたConfigを自動生成します。")
         target_id = st.selectbox("対象機器を選択:", list(TOPOLOGY.keys()))
         target_node = TOPOLOGY[target_id]
-        
         vendor = target_node.metadata.get("vendor", "Unknown")
-        os_type = target_node.metadata.get("os", "Unknown")
-        st.caption(f"Device Info: {vendor} / {os_type}")
-        
+        st.caption(f"Device Info: {vendor}")
         current_conf = load_config_by_id(target_id)
         with st.expander("現在のConfigを確認"):
             st.code(current_conf if current_conf else "(No current config)")
-
         intent = st.text_area("Intent:", height=150, placeholder="例: Gi0/1にVLAN100を割り当てて。")
-        
         if st.button("✨ Config生成", type="primary"):
             if not api_key or not intent:
                 st.error("API Key or Intent Missing")
@@ -335,7 +355,6 @@ elif app_mode == "🔧 設定生成":
                 with st.spinner("Generating..."):
                     generated_conf = generate_config_from_intent(target_node, current_conf, intent, api_key)
                     st.session_state.generated_conf = generated_conf
-
     with c2:
         st.subheader("📝 Generated Config")
         if "generated_conf" in st.session_state:
@@ -343,7 +362,6 @@ elif app_mode == "🔧 設定生成":
             st.success("生成完了")
         else:
             st.info("左側のフォームから指示を入力してください。")
-
         st.markdown("---")
         st.subheader("🔍 Health Check Commands")
         if st.button("正常性確認コマンドを生成"):
