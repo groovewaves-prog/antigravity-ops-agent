@@ -16,7 +16,7 @@ from bayes_engine import BayesianRCA
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
 
 # ==========================================
-# 関数定義 (省略なし)
+# 関数定義
 # ==========================================
 def find_target_node_id(topology, node_type=None, layer=None, keyword=None):
     for node_id, node in topology.items():
@@ -114,6 +114,7 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.trigger_analysis = False
     st.session_state.verification_result = None
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
+    # シナリオ変更時はベイズエンジンもリセット（初期証拠を入れ直すため）
     if "bayes_engine" in st.session_state: del st.session_state.bayes_engine
     st.rerun()
 
@@ -165,9 +166,11 @@ else:
             alarms = [Alarm(target_device_id, "Memory High", "WARNING")]
             root_severity = "WARNING"
 
-# 2. ベイズエンジン初期化 & 初期証拠注入
+# 2. ベイズエンジン初期化 & 初期証拠注入 (★ここを修正)
 if "bayes_engine" not in st.session_state:
     st.session_state.bayes_engine = BayesianRCA(TOPOLOGY)
+    
+    # シナリオ選択の時点で、AIに「アラーム証拠」を与える
     if "BGP" in selected_scenario:
         st.session_state.bayes_engine.update_probabilities("alarm", "BGP Flapping")
     elif "全回線断" in selected_scenario or "両系" in selected_scenario:
@@ -175,24 +178,25 @@ if "bayes_engine" not in st.session_state:
         st.session_state.bayes_engine.update_probabilities("log", "Interface Down")
     elif "片系" in selected_scenario:
         st.session_state.bayes_engine.update_probabilities("alarm", "HA Failover")
+    elif "FAN" in selected_scenario:
+        # ★追加: FAN故障ならFANアラームが出ているはず
+        st.session_state.bayes_engine.update_probabilities("alarm", "Fan Fail")
 
-# 3. コックピット表示（インタラクティブ版）
-# dashboard.py の修正により、ここでクリックされた行の候補が返ってくる
+# 3. コックピット表示
 selected_incident_candidate = None
 if "bayes_engine" in st.session_state:
     selected_incident_candidate = render_intelligent_alarm_viewer(st.session_state.bayes_engine, selected_scenario)
 
-# 4. 画面分割 (左: マップと診断 / 右: 分析結果・チャット)
+# 4. 画面分割
 col_map, col_chat = st.columns([1.2, 1])
 
-# === 左カラム: トポロジーと診断ボタン ===
+# === 左カラム: トポロジーと診断 ===
 with col_map:
     st.subheader("🌐 Network Topology")
     
     current_root_node = None
     current_severity = "WARNING"
     
-    # 選択中のインシデントがあれば、マップ上でも強調する
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
         current_root_node = TOPOLOGY.get(selected_incident_candidate["id"])
         current_severity = "CRITICAL"
@@ -205,7 +209,6 @@ with col_map:
     st.markdown("---")
     st.subheader("🛠️ Auto-Diagnostics")
     
-    # 診断ボタン
     if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
         if not api_key:
             st.error("API Key Required")
@@ -214,6 +217,7 @@ with col_map:
                 st.write("🔌 Connecting to device...")
                 target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
                 
+                # ここで sanitization が走ります
                 res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
                 st.session_state.live_result = res
                 
@@ -231,64 +235,55 @@ with col_map:
                     status.update(label="Diagnostics Failed", state="error")
             st.rerun()
 
-# === 右カラム: 分析結果(Why)と診断ログ ===
+# === 右カラム: 分析レポート ===
 with col_chat:
-    st.subheader("🔍 Analysis & Operations")
+    st.subheader("📝 AI Analyst Report")
     
-    # --- A. 選択されたインシデントの「根拠 (Why)」を表示 ---
+    # --- A. 状況報告 (Situation Report) ---
+    # コックピットで選択された行（またはデフォルト1位）の情報を表示
     if selected_incident_candidate:
         cand = selected_incident_candidate
         
-        # 根拠テキストの生成（簡易ロジック）
-        reasoning_text = []
-        if cand["prob"] > 0.8:
-            reasoning_text.append("✅ **高い確信度 (High Confidence):** 過去の障害パターンと 90% 以上一致しています。")
+        # 色分け用スタイルの決定
+        alert_color = "#e3f2fd" # Blue (Info)
+        if cand["prob"] > 0.8: alert_color = "#ffebee" # Red (Critical)
+        elif cand["prob"] > 0.4: alert_color = "#fff3e0" # Orange (Warning)
         
-        # シナリオ/証拠に応じた理由付け（デモ用）
-        if "Hardware" in cand["type"]:
-            if "log" in str(st.session_state.bayes_engine.priors): # 簡易チェック
-                 reasoning_text.append("- ログに **Physical Down** または **Hardware Error** が検出されました。")
-            else:
-                 reasoning_text.append("- 通信断(Ping NG) と アラーム傾向 が物理障害パターンを示唆しています。")
+        st.markdown(f"""
+        <div style="background-color:{alert_color};padding:15px;border-radius:10px;border-left:5px solid #d32f2f;margin-bottom:15px;">
+            <h4 style="margin:0;">状況報告: {cand['id']}</h4>
+            <p style="margin:5px 0;"><strong>障害種別:</strong> {cand['type']}</p>
+            <p style="margin:5px 0;"><strong>AI確信度:</strong> {cand['prob']:.1%}</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 簡易分析コメントの生成
+        analysis_text = ""
+        if "Hardware" in cand["type"] or "Fan" in cand["type"]:
+            analysis_text = "ハードウェアレベルの障害（電源、FAN、ケーブル等）が強く疑われます。ログおよび物理ステータスの確認が必要です。"
         elif "Config" in cand["type"]:
-             reasoning_text.append("- 物理リンクは正常ですが、プロトコルエラー(BGP/OSPF)が多発しています。")
-        
-        # UI表示
-        container = st.container(border=True)
-        container.markdown(f"#### 📌 Focus: {cand['id']}")
-        container.markdown(f"**判定:** `{cand['type']}` (確率: {cand['prob']:.1%})")
-        if reasoning_text:
-            container.markdown("".join(reasoning_text))
+            analysis_text = "物理リンクは維持されていますが、設定ミスやプロトコル不整合による通信障害の可能性があります。"
         else:
-            container.caption("詳細な根拠を収集中...")
+            analysis_text = "複数の要因が考えられます。詳細診断を実行してください。"
+            
+        st.info(f"💡 **AI Analysis:**\n\n{analysis_text}")
 
-    # --- B. 診断実行結果の表示 (右カラムに出力) ---
+    # --- B. 診断実行結果 (Sanitized Logs) ---
     if st.session_state.live_result:
         res = st.session_state.live_result
         if res["status"] == "SUCCESS":
-            with st.expander("📄 診断実行結果 (Diagnostic Results)", expanded=True):
-                # 検証結果
+            with st.expander("📄 診断ログ出力 (🔒 Sanitized)", expanded=True):
                 if st.session_state.verification_result:
                     v = st.session_state.verification_result
-                    st.markdown("**【自動検証結果】**")
-                    col_v1, col_v2 = st.columns(2)
-                    col_v1.info(f"Ping: {v.get('ping_status')}")
-                    col_v2.error(f"IF Status: {v.get('interface_status')}")
-                    st.markdown("---")
-                
-                # 生ログ
-                st.markdown("**【取得ログ (Sanitized)】**")
+                    st.caption(f"Verification: {v.get('hardware_status', 'N/A')} / {v.get('interface_status', 'N/A')}")
                 st.code(res["sanitized_log"], language="text")
         elif res["status"] == "ERROR":
             st.error(f"診断エラー: {res.get('error')}")
 
-    # ---------------------------
-    # 自動修復 & チャット
-    # ---------------------------
+    # --- C. 自動修復 & チャット ---
     st.markdown("---")
-    st.subheader("🤖 AI Remediation")
+    st.subheader("🤖 Remediation & Chat")
 
-    # 自動修復提案
     if selected_incident_candidate and selected_incident_candidate["prob"] > 0.8:
         if "remediation_plan" not in st.session_state:
             if st.button("✨ 修復プランを作成 (Generate Fix)"):
@@ -305,23 +300,27 @@ with col_chat:
                         st.rerun()
         
         if "remediation_plan" in st.session_state:
-            st.info("以下のコマンドが生成されました")
             st.code(st.session_state.remediation_plan, language="cisco")
-            if st.button("🚀 修復実行 (Execute)", type="primary"):
-                with st.status("Applying Fix...", expanded=True):
-                    time.sleep(1)
-                    st.write("⚙️ Config pushed.")
-                    time.sleep(1)
-                st.balloons()
-                st.success("System Recovered.")
-                if st.button("リセット"):
+            col_exec1, col_exec2 = st.columns(2)
+            with col_exec1:
+                if st.button("🚀 修復実行 (Execute)", type="primary"):
+                    with st.status("Applying Fix...", expanded=True):
+                        time.sleep(1)
+                        st.write("⚙️ Config pushed.")
+                        time.sleep(1)
+                    st.balloons()
+                    st.success("System Recovered.")
+                    if st.button("リセット"):
+                        del st.session_state.remediation_plan
+                        st.session_state.current_scenario = "正常稼働"
+                        st.rerun()
+            with col_exec2:
+                 if st.button("キャンセル"):
                     del st.session_state.remediation_plan
-                    st.session_state.current_scenario = "正常稼働"
                     st.rerun()
 
-    # チャット (下部に配置)
-    with st.expander("💬 AI Chat Assistant", expanded=False):
-        # チャット初期化
+    # チャット (常時表示)
+    with st.expander("💬 Chat with AI Agent", expanded=False):
         if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it")
@@ -330,7 +329,7 @@ with col_chat:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]): st.markdown(msg["content"])
 
-        if prompt := st.chat_input("Ask AI..."):
+        if prompt := st.chat_input("Ask details..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
             if st.session_state.chat_session:
@@ -340,7 +339,7 @@ with col_chat:
                         st.markdown(res.text)
                         st.session_state.messages.append({"role": "assistant", "content": res.text})
 
-# ベイズ更新トリガー (診断完了後)
+# ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
     if st.session_state.verification_result:
         v_res = st.session_state.verification_result
