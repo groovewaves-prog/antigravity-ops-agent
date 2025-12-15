@@ -6,7 +6,7 @@ class LogicalRCA:
     def __init__(self, topology):
         self.topology = topology
         
-        # 親ID -> 子IDリスト のマップを作成（高速な伝播用）
+        # 親ID -> 子IDリスト のマップ
         self.parent_to_children = {}
         for node_id, node in self.topology.items():
             if node.parent_id:
@@ -14,7 +14,7 @@ class LogicalRCA:
                     self.parent_to_children[node.parent_id] = []
                 self.parent_to_children[node.parent_id].append(node_id)
 
-        # ■ 1. 基本シグネチャ
+        # 基本シグネチャ
         self.signatures = [
             {
                 "type": "Hardware/Critical_Multi_Fail",
@@ -55,7 +55,7 @@ class LogicalRCA:
         ]
 
     def _get_all_descendants(self, root_id):
-        """指定されたノード配下の全子孫ノードIDを取得する（再帰）"""
+        """再帰的に配下の全ノードを取得"""
         descendants = set()
         stack = [root_id]
         while stack:
@@ -68,23 +68,18 @@ class LogicalRCA:
         return descendants
 
     def analyze(self, current_alarms):
-        """
-        アラーム分析 + トポロジー影響伝播
-        """
         candidates = []
         device_alarms = {}
         
-        # 1. アラームグルーピング
         for alarm in current_alarms:
             if alarm.device_id not in device_alarms:
                 device_alarms[alarm.device_id] = []
             device_alarms[alarm.device_id].append(alarm)
             
-        # 2. 直接的なアラーム評価（根本原因の特定）
+        # 1. 直接的なアラーム評価
         for device_id, alarms in device_alarms.items():
             best_match = None
             max_score = 0.0
-            
             for sig in self.signatures:
                 if sig["rules"](alarms):
                     score = min(sig["base_score"] + (len(alarms) * 0.02), 1.0)
@@ -111,7 +106,7 @@ class LogicalRCA:
                     "verification_log": ""
                 })
 
-        # 3. サイレント障害検知 (L2SW/Parent Logic)
+        # 2. サイレント障害検知
         down_children_count = {} 
         for alarm in current_alarms:
             msg = alarm.message.lower()
@@ -149,41 +144,48 @@ class LogicalRCA:
                         "verification_log": active_verification_log
                     })
 
-        # 4. ★追加機能: 影響伝播 (Topology Impact Propagation)
-        # 根本原因(Critical)が確定している場合、その配下すべてを「影響下」としてマークする
-        
-        # まず根本原因IDのリストを作成
+        # 3. ★修正: 影響伝播 (冗長化考慮版)
         root_cause_ids = [c['id'] for c in candidates if c['prob'] > 0.8]
         impacted_nodes = set()
         
         for rid in root_cause_ids:
-            # その配下を全て取得
-            descendants = self._get_all_descendants(rid)
-            impacted_nodes.update(descendants)
+            # 冗長構成チェック: パートナーが生きていれば伝播させない
+            node = self.topology.get(rid)
+            should_propagate = True
             
-        # 影響下のノードを候補リストに追加（または更新）
+            if node and node.redundancy_group:
+                # 同じグループの他ノードを探す
+                partners = [nid for nid, n in self.topology.items() 
+                           if n.redundancy_group == node.redundancy_group and nid != rid]
+                
+                # パートナーが「生存（RootCauseリストにいない）」なら、伝播を止める
+                # (簡易ロジック: パートナーも障害なら伝播する)
+                partners_alive = [p for p in partners if p not in root_cause_ids]
+                
+                if partners_alive:
+                    should_propagate = False # パートナーが生きているので配下は無事
+            
+            if should_propagate:
+                descendants = self._get_all_descendants(rid)
+                impacted_nodes.update(descendants)
+            
         for node_id in impacted_nodes:
-            # 既にリストにある場合（直接アラームが出ている場合など）
             existing = next((c for c in candidates if c['id'] == node_id), None)
-            
             if existing:
-                # 自分が根本原因でないなら、ステータスを「影響下」に上書き
                 if existing['prob'] <= 0.8:
                     existing['type'] = "Network/Secondary"
                     existing['label'] = "影響下 (上位障害による通信不能)"
-                    existing['prob'] = 0.50 # 警告レベルより下げる
+                    existing['prob'] = 0.50 
             else:
-                # リストにない（正常に見えていた）場合 -> 新規追加
                 candidates.append({
                     "id": node_id,
                     "type": "Network/Unreachable",
                     "label": "応答なし (上位障害の影響)",
-                    "prob": 0.50, # 監視中よりは深刻だが、根本原因ではない
+                    "prob": 0.50, 
                     "alarms": ["Parent node failure"],
                     "verification_log": ""
                 })
 
-        # 5. ソート
         candidates.sort(key=lambda x: x["prob"], reverse=True)
         
         if not candidates:
