@@ -2,11 +2,11 @@ import pandas as pd
 import random
 
 # 生成するデータ数
-NUM_SAMPLES = 5000
+NUM_SAMPLES = 6000 # 少し増やす
 
 # ■ 世界の法則（シナリオ定義）
 SCENARIOS = [
-    # 1. WANルーター物理故障
+    # 1. WANルーター物理故障 (単体)
     {
         "root_cause_id": "WAN_ROUTER_01",
         "root_cause_type": "Hardware/Physical",
@@ -22,7 +22,7 @@ SCENARIOS = [
     {
         "root_cause_id": "WAN_ROUTER_01",
         "root_cause_type": "Config/Software",
-        "weight": 0.3,
+        "weight": 0.2,
         "probabilities": {
             ("alarm", "BGP Flapping"): 0.85,
             ("log", "Interface Down"): 0.05,
@@ -41,19 +41,32 @@ SCENARIOS = [
             ("log", "Power Fail"): 0.80
         }
     },
-    # 4. L2スイッチ/FAN故障 (★新規追加)
+    # 4. L2スイッチ FAN故障
     {
-        "root_cause_id": "L2_SW", # 汎用的なIDとして学習させる
+        "root_cause_id": "L2_SW",
         "root_cause_type": "Hardware/Fan",
-        "weight": 0.15,
+        "weight": 0.1,
         "probabilities": {
-            ("alarm", "Fan Fail"): 0.95,      # FAN故障なら必ずFANアラームが出る
-            ("log", "High Temperature"): 0.60, # 温度上昇も伴うことが多い
-            ("ping", "NG"): 0.05,             # FAN故障だけなら通信は切れないことが多い
+            ("alarm", "Fan Fail"): 0.95,
+            ("log", "High Temperature"): 0.60,
+            ("ping", "NG"): 0.05,
             ("log", "System Warning"): 0.80
         }
     },
-    # 5. 外部ISP障害（ノイズ）
+    # ★追加 5. 複合クリティカル障害 (電源+FAN同時故障)
+    {
+        "root_cause_id": "WAN_ROUTER_01",
+        "root_cause_type": "Hardware/Critical_Multi_Fail",
+        "weight": 0.1,
+        "probabilities": {
+            ("alarm", "Power Supply 1 Failed"): 0.95,
+            ("alarm", "Fan Fail"): 0.95,
+            ("log", "System Overheat"): 0.80,
+            ("log", "Thermal Shutdown"): 0.50,
+            ("ping", "NG"): 0.95
+        }
+    },
+    # 6. 外部ISP障害（ノイズ）
     {
         "root_cause_id": "External_ISP",
         "root_cause_type": "Network",
@@ -73,7 +86,6 @@ def generate_mock_data():
     for _ in range(NUM_SAMPLES):
         scenario = random.choices(SCENARIOS, weights=[s["weight"] for s in SCENARIOS])[0]
         
-        # IDの揺らぎを持たせる（L2_SWなら L2_SW_01, L2_SW_02 など）
         r_id = scenario['root_cause_id']
         if r_id == "L2_SW":
             r_id = random.choice(["L2_SW_01", "L2_SW_02"])
