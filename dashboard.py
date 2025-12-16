@@ -1,6 +1,4 @@
-from pathlib import Path
-
-content = r'''import json
+import json
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
@@ -195,9 +193,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-
-path = Path("/mnt/data/dashboard_fixed_v2.py")
-path.write_text(content, encoding="utf-8")
-str(path), path.stat().st_size
-
