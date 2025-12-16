@@ -1,137 +1,231 @@
-import json
+from pathlib import Path
+
+fixed_path = Path("/mnt/data/inference_engine_fixed.py")
+fixed_path.write_text("""import json
 import os
 import re
 import google.generativeai as genai
 from enum import Enum
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
+# ==========================================================
 # AIOpsの判定ステータス
+# ==========================================================
 class HealthStatus(Enum):
     NORMAL = "GREEN"
     WARNING = "YELLOW"
     CRITICAL = "RED"
 
-# app.pyからの呼び出し名に合わせてクラス名をLogicalRCAに変更
+
 class LogicalRCA:
+    \"""
+    LogicalRCA:
+      - LLM によるコンフィグ解釈（ベンダ差分の吸収）
+      - トポロジー文脈（親子関係）を用いたカスケード抑制
+      - “冗長が効いてるなら黄色、止まってるなら赤” を優先
+    \"""
+
     def __init__(self, topology, config_dir: str = "./configs"):
-        """
-        LogicalRCA (旧 InferenceEngine) の初期化
-        :param topology: トポロジー辞書オブジェクト または ファイルパス (str)
-        :param config_dir: コンフィグファイルが格納されているディレクトリ (デフォルト: ./configs)
-        """
-        # topologyが文字列（ファイルパス）の場合はファイルから読み込み
+        \"""
+        :param topology: トポロジー辞書オブジェクト または JSONファイルパス(str)
+        :param config_dir: コンフィグファイルが格納されているディレクトリ
+        \"""
         if isinstance(topology, str):
             self.topology = self._load_topology(topology)
-        # 辞書の場合はそのまま使用
         elif isinstance(topology, dict):
             self.topology = topology
         else:
             raise ValueError("topology must be either a file path (str) or a dictionary")
-        
+
         self.config_dir = config_dir
         self.model = None
         self._api_configured = False
 
-    def _ensure_api_configured(self):
-        """APIキーの設定を確認・初期化（遅延評価）"""
+    # ----------------------------
+    # Topology helpers
+    # ----------------------------
+    def _get_device_info(self, device_id: str) -> Any:
+        return self.topology.get(device_id, {})
+
+    def _get_parent_id(self, device_id: str) -> Optional[str]:
+        info = self._get_device_info(device_id)
+        if hasattr(info, "parent_id"):
+            return getattr(info, "parent_id")
+        if isinstance(info, dict):
+            return info.get("parent_id")
+        return None
+
+    def _get_metadata(self, device_id: str) -> Dict[str, Any]:
+        info = self._get_device_info(device_id)
+        if hasattr(info, "metadata"):
+            md = getattr(info, "metadata")
+            return md if isinstance(md, dict) else {}
+        if isinstance(info, dict):
+            md = info.get("metadata", {})
+            return md if isinstance(md, dict) else {}
+        return {}
+
+    def _get_psu_count(self, device_id: str, default: int = 1) -> int:
+        \"""
+        topology.json の metadata.hw_inventory.psu_count を参照。
+        存在しない場合は default（1）を返す。
+        \"""
+        md = self._get_metadata(device_id)
+        hw = md.get("hw_inventory", {}) if isinstance(md, dict) else {}
+        try:
+            psu = hw.get("psu_count", default) if isinstance(hw, dict) else default
+            return int(psu)
+        except Exception:
+            return default
+
+    # ----------------------------
+    # LLM init
+    # ----------------------------
+    def _ensure_api_configured(self) -> bool:
+        \"""APIキーの設定を確認・初期化（遅延評価）\"""
         if self._api_configured:
             return True
-        
+
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             return False
-        
+
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            self.model = genai.GenerativeModel("gemini-1.5-flash")
             self._api_configured = True
             return True
         except Exception as e:
             print(f"[!] API Configuration Error: {e}")
             return False
 
+    # ----------------------------
+    # IO
+    # ----------------------------
     def _load_topology(self, path: str) -> Dict:
-        """JSONファイルからトポロジー情報を読み込む"""
+        \"""JSONファイルからトポロジー情報を読み込む\"""
         if not os.path.exists(path):
             return {}
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def _read_config(self, device_id: str) -> str:
-        """デバイスIDに対応するコンフィグファイルを読み込む"""
+        \"""デバイスIDに対応するコンフィグファイルを読み込む\"""
         config_path = os.path.join(self.config_dir, f"{device_id}.txt")
         if os.path.exists(config_path):
             try:
-                with open(config_path, 'r', encoding='utf-8') as f:
+                with open(config_path, "r", encoding="utf-8") as f:
                     return f.read()
             except Exception as e:
                 return f"Error reading config: {str(e)}"
         return "Config file not found."
 
+    # ----------------------------
+    # Sanitization
+    # ----------------------------
     def _sanitize_text(self, text: str) -> str:
-        """機密情報のサニタイズ処理"""
-        # パスワード系 (Cisco/Junos)
-        text = re.sub(r'(encrypted-password\s+)"[^"]+"', r'\1"********"', text)
-        text = re.sub(r'(password|secret)\s+(\d)\s+\S+', r'\1 \2 ********', text)
-        text = re.sub(r'(username\s+\S+\s+secret)\s+\d\s+\S+', r'\1 5 ********', text)
-        # SNMP Community
-        text = re.sub(r'(snmp-server community)\s+\S+', r'\1 ********', text)
+        \"""機密情報のサニタイズ処理\"""
+        text = re.sub(r'(encrypted-password\\s+)"[^"]+"', r'\\1"********"', text)
+        text = re.sub(r"(password|secret)\\s+(\\d)\\s+\\S+", r"\\1 \\2 ********", text)
+        text = re.sub(r"(username\\s+\\S+\\s+secret)\\s+\\d\\s+\\S+", r"\\1 5 ********", text)
+        text = re.sub(r"(snmp-server community)\\s+\\S+", r"\\1 ********", text)
         return text
 
+    # ==========================================================
+    # Public API
+    # ==========================================================
     def analyze(self, alarms: List) -> List[Dict[str, Any]]:
-        """
-        アラームリストを分析して根本原因候補を返す
-        app.pyから呼び出される主要なメソッド
-        
-        :param alarms: Alarmオブジェクトのリスト
-        :return: 分析結果のリスト（辞書形式）
-        """
-        results = []
-        
+        \"""
+        アラームリストを分析して根本原因候補を返す（辞書形式）
+
+        改善ポイント:
+          1) 同一デバイスの複数アラームを“まとめて”判断
+          2) 親が落ちているときの子の Unreachable を根本原因扱いしない
+          3) “冗長OKなら黄色、停止なら赤” をローカル安全ルールで確定
+        \"""
         if not alarms:
             return [{
                 "id": "SYSTEM",
                 "label": "No alerts detected",
                 "prob": 0.0,
                 "type": "Normal",
-                "tier": 0
+                "tier": 0,
+                "reason": "No active alerts detected."
             }]
-        
-        # 各アラームに対して分析を実行
-        for alarm in alarms:
-            device_id = alarm.device_id
-            alert_messages = [alarm.message]
-            
-            # LLMによる冗長性深度分析
-            analysis = self.analyze_redundancy_depth(device_id, alert_messages)
-            
-            # 結果を整形
-            prob = 0.5  # デフォルト
-            if analysis["status"] == HealthStatus.CRITICAL:
-                prob = 0.9
-            elif analysis["status"] == HealthStatus.WARNING:
-                prob = 0.7
+
+        # device_id -> [messages...]
+        msg_map: Dict[str, List[str]] = {}
+        for a in alarms:
+            msg_map.setdefault(a.device_id, []).append(a.message)
+
+        alarmed_ids = set(msg_map.keys())
+
+        def parent_is_alarmed(dev: str) -> bool:
+            p = self._get_parent_id(dev)
+            return bool(p and (p in alarmed_ids))
+
+        results: List[Dict[str, Any]] = []
+
+        # デバイス単位で判断（まとめて渡す）
+        for device_id, messages in msg_map.items():
+            # 1) カスケード抑制（親もアラーム中のときの子の Unreachable）
+            if any("Unreachable" in m for m in messages) and parent_is_alarmed(device_id):
+                p = self._get_parent_id(device_id)
+                results.append({
+                    "id": device_id,
+                    "label": " / ".join(messages),
+                    "prob": 0.2,
+                    "type": "Network/Unreachable",
+                    "tier": 3,
+                    "reason": f"Downstream unreachable due to upstream alarm (parent={p})."
+                })
+                continue
+
+            # 2) 冗長性/停止の判定（ローカル安全ルール→必要ならLLM）
+            analysis = self.analyze_redundancy_depth(device_id, messages)
+
+            # 3) 確信度マッピング
+            if analysis.get("impact_type") == "UNKNOWN" and "API key not configured" in analysis.get("reason", ""):
+                prob = 0.5
+                tier = 3
             else:
-                prob = 0.3
-            
+                if analysis["status"] == HealthStatus.CRITICAL:
+                    prob = 0.9
+                    tier = 1
+                elif analysis["status"] == HealthStatus.WARNING:
+                    prob = 0.7
+                    tier = 2
+                else:
+                    prob = 0.3
+                    tier = 3
+
             results.append({
                 "id": device_id,
-                "label": alarm.message,
+                "label": " / ".join(messages),
                 "prob": prob,
-                "type": analysis["impact_type"],
-                "tier": 1 if prob > 0.6 else 2,
-                "reason": analysis["reason"]
+                "type": analysis.get("impact_type", "UNKNOWN"),
+                "tier": tier,
+                "reason": analysis.get("reason", "AI provided no reason")
             })
-        
-        # 確率順にソート
+
         results.sort(key=lambda x: x["prob"], reverse=True)
-        
         return results
 
+    # ==========================================================
+    # Core decision function
+    # ==========================================================
     def analyze_redundancy_depth(self, device_id: str, alerts: List[str]) -> Dict[str, Any]:
-        """
-        LLMを使用して冗長性深度を判定する
-        """
+        \"""
+        冗長性深度とサービス影響を判定する。
+
+        ローカル安全ルールで“確定できるもの”は確定し、
+        それ以外は LLM に委譲する（APIキーがある場合）。
+
+        # NOTE（日本語訳）:
+        # このルールは運用上の安全性を保証するために存在します。
+        # 将来、インベントリ＋過去の証跡が十分に利用できるようになったら、
+        # この判断はAIに委譲すべきです。
+        \"""
         if not alerts:
             return {
                 "status": HealthStatus.NORMAL,
@@ -139,7 +233,37 @@ class LogicalRCA:
                 "impact_type": "NONE"
             }
 
-        # APIキーの設定を確認
+        safe_alerts = [self._sanitize_text(a) for a in alerts]
+        joined = " ".join(safe_alerts)
+
+        # (A) ローカル安全ルール：停止（赤）確定
+        if ("Dual Loss" in joined) or ("Device Down" in joined) or ("Thermal Shutdown" in joined):
+            return {
+                "status": HealthStatus.CRITICAL,
+                "reason": "Dual PSU loss / device down detected (local safety rule).",
+                "impact_type": "Hardware/Physical"
+            }
+
+        # (B) ローカル安全ルール：PSU片系（黄色/赤）
+        psu_count = self._get_psu_count(device_id, default=1)
+        psu_single_fail = (
+            ("Power Supply" in joined and "Failed" in joined and "Dual" not in joined)
+            or ("PSU" in joined and "Fail" in joined and "Dual" not in joined)
+        )
+        if psu_single_fail:
+            if psu_count >= 2:
+                return {
+                    "status": HealthStatus.WARNING,
+                    "reason": f"Single PSU failure with redundancy (psu_count={psu_count}) (local safety rule).",
+                    "impact_type": "Hardware/Redundancy"
+                }
+            return {
+                "status": HealthStatus.CRITICAL,
+                "reason": f"Single PSU failure without redundancy (psu_count={psu_count}) (local safety rule).",
+                "impact_type": "Hardware/Physical"
+            }
+
+        # (C) LLMに委譲（APIキーがある場合）
         if not self._ensure_api_configured():
             return {
                 "status": HealthStatus.WARNING,
@@ -147,83 +271,61 @@ class LogicalRCA:
                 "impact_type": "UNKNOWN"
             }
 
-        device_info = self.topology.get(device_id, {})
+        metadata = self._get_metadata(device_id)
         raw_config = self._read_config(device_id)
-        
-        # TOPOLOGYが辞書の場合、metadataの取得方法を調整
-        if hasattr(device_info, 'metadata'):
-            metadata = device_info.metadata
-        elif isinstance(device_info, dict):
-            metadata = device_info.get('metadata', {})
-        else:
-            metadata = {}
-
-        # サニタイズ
         safe_config = self._sanitize_text(raw_config)
-        safe_alerts = [self._sanitize_text(a) for a in alerts]
 
-        prompt = f"""
+        prompt = f\"\"\"
 あなたはネットワーク運用のエキスパートAIです。
 以下の情報に基づき、現在発生しているアラートが「サービス停止(CRITICAL)」を引き起こしているか、
 それとも「冗長機能によりサービスは維持されている(WARNING)」状態かを判定してください。
 
 ### 対象デバイス
-- **Device ID**: {device_id}
-- **Metadata**: {json.dumps(metadata)}
+- Device ID: {device_id}
+- Metadata: {json.dumps(metadata, ensure_ascii=False)}
 
 ### 設定ファイル (Config - Sanitized)
-```text
 {safe_config}
-```
 
 ### 発生中のアラートリスト
-{json.dumps(safe_alerts)}
+{json.dumps(safe_alerts, ensure_ascii=False)}
 
-### 判定ルール (Thinking Process)
-１．電源(PSU)障害の判定:
-  ・デバイスが複数のPSUを持っていると推測され、かつ「全て」ではなく「一部」のPSUのみがFailしている場合。
-  ・判定: WARNING (理由: Redundancy Lost - 片系運転中)
-  ・全てのPSUがFail、または単一PSUデバイスのFailの場合。
-  ・判定: CRITICAL (理由: Power Outage)
-２．インターフェース/LAG障害の判定:
-　・Configを確認し、Downしている物理インターフェースが LAG (Port-Channel / ae / Bond) のメンバーか確認してください。
-　・親となる論理インターフェース(Port-Channel Xなど)自体のアラートが出ていなければ、親はUpしているとみなします。
-　・メンバーのみのDownの場合。
-　・判定: WARNING (理由: Degraded - 帯域縮退)
-　・LAG非構成ポートのDown、または親LAG自体のDownの場合。
-　・判定: CRITICAL (理由: Link Down - Service Impacting)
-３．その他:
-　・上記に当てはまらない不明なエラーや、CPU高負荷などは内容に応じて判断してください。
+### 判定ルール（重要）
+- “冗長が効いている（サービス継続）”と判断できる限り、CRITICALにしないこと。
+- 逆に、サービス断（停止）が強く示唆される場合のみ CRITICAL にすること。
+
+（参考例）
+1) 電源(PSU)
+  - PSU冗長がある可能性が高く、片系のみFail → WARNING（片系運転）
+  - 両系Fail、または device down → CRITICAL
+2) インターフェース/LAG
+  - Downしている物理IFが LAG のメンバーで、親LAGがUp → WARNING（帯域縮退）
+  - 親LAG自体のDown、または非LAGの重要ポートDown → CRITICAL
 
 ### 出力フォーマット
-以下のJSON形式のみを出力してください。Markdownのコードブロック(```json ...)は含めないでください。
+以下のJSON形式のみを出力してください（Markdownコードブロックは不要）。
 {{
-  "status": "STATUS_STRING",
+  "status": "NORMAL|WARNING|CRITICAL",
   "reason": "判定理由を簡潔に記述",
-  "impact_type": "IMPACT_STRING"
+  "impact_type": "NONE|DEGRADED|REDUNDANCY_LOST|OUTAGE|UNKNOWN"
 }}
-
-- status: "NORMAL", "WARNING", "CRITICAL" のいずれか
-- impact_type: "NONE", "DEGRADED", "REDUNDANCY_LOST", "OUTAGE", "UNKNOWN" のいずれか
-"""
+\"\"\"
 
         try:
-            # LLMへの問い合わせ
             response = self.model.generate_content(
                 prompt,
                 generation_config={"response_mime_type": "application/json"}
             )
-            
-            # レスポンス解析
             response_text = response.text.strip()
+
             if response_text.startswith("```json"):
                 response_text = response_text[7:]
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
 
             result_json = json.loads(response_text)
-            
-            status_str = result_json.get("status", "CRITICAL").upper()
+
+            status_str = str(result_json.get("status", "CRITICAL")).upper()
             if status_str in ["GREEN", "NORMAL"]:
                 health_status = HealthStatus.NORMAL
             elif status_str in ["YELLOW", "WARNING"]:
@@ -240,34 +342,30 @@ class LogicalRCA:
         except Exception as e:
             print(f"[!] AI Inference Error: {e}")
             return {
-                "status": HealthStatus.CRITICAL,
+                "status": HealthStatus.WARNING,
                 "reason": f"AI Analysis Failed: {str(e)}",
                 "impact_type": "AI_ERROR"
             }
 
 
 if __name__ == "__main__":
-    # テスト用設定
     TEST_TOPOLOGY = "topology.json"
     TEST_CONFIG_DIR = "./configs"
 
-    # 簡易的なファイル生成（ディレクトリが存在しない場合のみ作成）
-    if not os.path.exists(TEST_CONFIG_DIR):
-        os.makedirs(TEST_CONFIG_DIR)
+    engine = LogicalRCA(TEST_TOPOLOGY, TEST_CONFIG_DIR)
 
-    try:
-        # クラス名をLogicalRCAに変更して初期化
-        engine = LogicalRCA(TEST_TOPOLOGY, TEST_CONFIG_DIR)
-        
-        print("--- AI Redundancy Analysis Test (LogicalRCA) ---")
-        test_device = "WAN_ROUTER_01"
-        test_alerts = ["Environment: PSU 1 Status Failed", "Environment: PSU 2 Status OK"]
-        
-        result = engine.analyze_redundancy_depth(test_device, test_alerts)
-        print(f"Result: {result['status'].value} ({result['impact_type']})")
-        print(f"Reason: {result['reason']}")
+    class _Alarm:
+        def __init__(self, device_id, message):
+            self.device_id = device_id
+            self.message = message
 
-    except ValueError as e:
-        print(f"Config Error: {e}")
-    except Exception as e:
-        print(f"Execution Error: {e}")
+    test_alarms = [
+        _Alarm("WAN_ROUTER_01", "Power Supply: Dual Loss (Device Down)"),
+        _Alarm("FW_01_PRIMARY", "Unreachable"),
+        _Alarm("CORE_SW_01", "Unreachable"),
+    ]
+
+    print(json.dumps(engine.analyze(test_alarms), ensure_ascii=False, indent=2))
+""", encoding="utf-8")
+
+str(fixed_path), fixed_path.stat().st_size
