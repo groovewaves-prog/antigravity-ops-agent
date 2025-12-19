@@ -60,7 +60,9 @@ def generate_content_with_retry(model, prompt, stream=True, retries=3):
 
 
 def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
-    """LLMを呼ばない疑似診断（503/コスト対策）。UXは維持しつつ、材料を増やすためのログを生成します。"""
+    """LLMを呼ばない疑似診断（503/コスト対策）。UXは維持しつつ、材料を増やすためのログを生成します。
+    重要: 「修復実行(Execute)」で復旧成功した後は、同一シナリオに限り成功側の疑似ログを返します。
+    """
     device_id = getattr(target_node_obj, "id", "UNKNOWN") if target_node_obj else "UNKNOWN"
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = [
@@ -70,14 +72,60 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
         "",
     ]
 
+    # 復旧成功フラグ（デモ用）
+    recovered_devices = st.session_state.get("recovered_devices") or {}
+    recovered_map = st.session_state.get("recovered_scenario_map") or {}
+
+    if recovered_devices.get(device_id) and recovered_map.get(device_id) == selected_scenario:
+        # “復旧後”の疑似ログ（成功）
+        if "FW" in selected_scenario:
+            lines += [
+                "show chassis cluster status",
+                "Redundancy group 0: healthy",
+                "control link: up",
+                "fabric link: up",
+            ]
+        elif "WAN" in selected_scenario or "WAN全回線断" in selected_scenario:
+            lines += [
+                "show ip interface brief",
+                "GigabitEthernet0/0 up up",
+                "show ip bgp summary",
+                "Neighbor 203.0.113.2 Established",
+                "ping 203.0.113.2 repeat 5",
+                "Success rate is 100 percent (5/5)",
+            ]
+        elif "L2SW" in selected_scenario:
+            lines += [
+                "show environment",
+                "Fan: OK",
+                "Temperature: OK",
+                "show interface status",
+                "Uplink: up",
+            ]
+        else:
+            lines += [
+                "show system alarms",
+                "No active alarms",
+                "ping 8.8.8.8 repeat 5",
+                "Success rate is 100 percent (5/5)",
+            ]
+
+        return {
+            "status": "SUCCESS",
+            "sanitized_log": "\n".join(lines),
+            "verification_log": "N/A",
+            "device_id": device_id,
+        }
+
+    # “障害中”の疑似ログ（現状維持）
     if "WAN全回線断" in selected_scenario or "[WAN]" in selected_scenario:
         lines += [
-            "show interface GigabitEthernet0/0",
-            "GigabitEthernet0/0 is down, line protocol is down",
+            "show ip interface brief",
+            "GigabitEthernet0/0 down down",
             "show ip bgp summary",
-            "Neighbor 203.0.113.2  Idle",
+            "Neighbor 203.0.113.2 Idle",
             "ping 203.0.113.2 repeat 5",
-            "!!!!!  (0/5 success)",
+            "Success rate is 0 percent (0/5)",
         ]
     elif "FW片系障害" in selected_scenario or "[FW]" in selected_scenario:
         lines += [
@@ -106,6 +154,7 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
         "verification_log": "N/A",
         "device_id": device_id,
     }
+
 
 def _hash_text(text: str) -> str:
     import hashlib
@@ -213,9 +262,16 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine"]:
+for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map"]:
     if key not in st.session_state:
         st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
+
+
+# 復旧状態（デモ用）
+if st.session_state.recovered_devices is None:
+    st.session_state.recovered_devices = {}
+if st.session_state.recovered_scenario_map is None:
+    st.session_state.recovered_scenario_map = {}
 
 # エンジン初期化
 if not st.session_state.logic_engine:
@@ -627,6 +683,11 @@ with col_chat:
                 is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
                 
                 if is_success:
+                    # 復旧成功フラグ（デモ用）。次回の「診断実行」で成功側の疑似ログを返します。
+                    st.session_state.recovered_devices = st.session_state.get("recovered_devices") or {}
+                    st.session_state.recovered_scenario_map = st.session_state.get("recovered_scenario_map") or {}
+                    st.session_state.recovered_devices[target_device_id] = True
+                    st.session_state.recovered_scenario_map[target_device_id] = selected_scenario
                     st.balloons()
                     st.success("✅ System Recovered Successfully!")
                 else:
