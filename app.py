@@ -2,8 +2,10 @@ import streamlit as st
 import graphviz
 import os
 import time
+import random
 import google.generativeai as genai
 import json
+import hashlib
 from dataclasses import asdict
 import pandas as pd
 from google.api_core import exceptions as google_exceptions
@@ -47,15 +49,188 @@ def load_config_by_id(device_id):
                 pass
     return "Config file not found."
 
-def generate_content_with_retry(model, prompt, stream=True, retries=3):
-    """503エラー対策のリトライ付き生成関数"""
+def generate_content_with_retry(model, prompt, stream=True, retries=5, base_sleep=1.5, max_sleep=12.0):
+    """Gemini呼び出しのリトライ（503/429/一時障害）とエラーメッセージ整形。
+    - ServiceUnavailable(503), ResourceExhausted(429) を主対象に指数バックオフで再試行
+    - stream=True の場合も同様に generate_content を呼び出す（返り値は iterator ）
+    """
+    last_exc = None
     for i in range(retries):
         try:
             return model.generate_content(prompt, stream=stream)
-        except google_exceptions.ServiceUnavailable:
-            if i == retries - 1: raise
-            time.sleep(2 * (i + 1))
-    return None
+        except (
+            google_exceptions.ServiceUnavailable,
+            google_exceptions.ResourceExhausted,
+            google_exceptions.DeadlineExceeded,
+            google_exceptions.InternalServerError,
+        ) as e:
+            # 典型的には「混雑」「一時的な内部障害」「レート制限」
+            last_exc = e
+            if i == retries - 1:
+                raise
+            # exponential backoff + small jitter
+            sleep_s = min(max_sleep, base_sleep * (2 ** i)) * (0.85 + random.random() * 0.3)
+            time.sleep(sleep_s)
+        except (
+            google_exceptions.Unauthenticated,
+            google_exceptions.PermissionDenied,
+            google_exceptions.InvalidArgument,
+        ) as e:
+            # APIキー/権限/リクエスト不正はリトライしても改善しにくい
+            raise
+        except Exception as e:
+            last_exc = e
+            if i == retries - 1:
+                raise
+            time.sleep(min(max_sleep, base_sleep * (2 ** i)))
+    raise last_exc if last_exc else RuntimeError("Unknown generation error")
+
+
+
+# ==========================================
+# LLM最小化: 生成物バンドル/キャッシュ/パース
+# ==========================================
+def _stable_hash(s: str) -> str:
+    try:
+        return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
+    except Exception:
+        return "0"*40
+
+def _extract_section_by_h3(md_text: str, heading_keyword: str) -> str:
+    """### 見出し単位でセクション本文を抜き出す（次の###まで）。見つからなければ空文字。"""
+    if not md_text:
+        return ""
+    lines = md_text.splitlines()
+    out = []
+    in_sec = False
+    for line in lines:
+        if line.strip().startswith("### "):
+            if in_sec:
+                break
+            if heading_keyword in line:
+                in_sec = True
+                out.append(line)
+                continue
+        if in_sec:
+            out.append(line)
+    return "\n".join(out).strip()
+
+def _extract_expectations(md_text: str) -> str:
+    # 期待結果/合否判定系を優先的に拾う
+    for key in ["期待結果", "合否判定", "Acceptance", "PASS/FAIL"]:
+        sec = _extract_section_by_h3(md_text, key)
+        if sec:
+            return sec
+    # fallback: 見出しが無い場合は空
+    return ""
+
+def _generate_bundle_prompt(selected_scenario: str, cand: dict, topology_context: dict, target_conf: str, verification_context: str) -> str:
+    return f"""あなたは熟練したネットワーク運用エンジニアです。
+以下の障害インシデントについて、**運用者向けの成果物を1つの回答にまとめて**作成してください。
+
+【重要方針】
+- 出力は必ず「です／ます調」で統一してください。
+- 顧客向けの定型句は禁止です（例:「原因究明と復旧作業を最優先で進めております」「随時ご報告いたします」など）。
+- 憶測で断定しません。推定する場合は根拠（観測事実）を併記してください。
+- コマンドは必ずMarkdownのコードブロックで囲ってください。
+- **期待結果（合否判定キー）**を必ず含めてください（例: "show interfaceでup/upが確認できる"、"BGPがEstablished"、"pingが0% loss" など）。
+- すべての成果物を1回の応答にまとめること（追加の質問・追加の出力はしない）。
+
+【入力情報】
+- 発生シナリオ: {selected_scenario}
+- 根本原因候補: {cand.get('id')} ({cand.get('label')})
+- リスクスコア: {cand.get('prob',0)*100:.0f}
+
+- CI/トポロジー情報(JSON):
+{json.dumps(topology_context, ensure_ascii=False, indent=2)}
+
+- 能動的診断結果（あれば）:
+{verification_context or "特になし"}
+
+- 対象機器Config（抜粋・あれば）:
+{(target_conf or "特になし")[:2000]}
+
+【出力フォーマット（厳守）】
+### 運用状況報告
+- 1. 観測事実
+- 2. 影響範囲（トポロジーから）
+- 3. 暫定原因と根拠
+- 4. 次の確認コマンド（期待結果つき）
+- 5. 切り分け手順（判断条件つき）
+
+### 復旧手順書
+#### 1. 物理対応（必要な場合）
+#### 2. 復旧コマンド (Recovery Config)
+```bash
+# commands...
+```
+#### 3. 正常性確認コマンド (Verification Commands)
+```bash
+# commands...
+```
+#### 4. 期待結果（合否判定キー）
+- コマンドごとに、PASS条件/FAIL条件を箇条書きで明示してください。
+
+"""
+
+
+def _simulate_verification_log(device_id: str, scenario: str) -> str:
+    # LLMを使わない簡易な疑似ログ（verifier.py のヒューリスティックが拾える語を含める）
+    base = [
+        f"DEVICE={device_id}",
+        f"SCENARIO={scenario}",
+        "PING: OK (0% loss)",
+        "INTERFACE: UP/UP",
+        "BGP: Established",
+        "HEALTHCHECK: OK",
+    ]
+    return "\n".join(base)
+
+def _ensure_cmd_state():
+    if "recovery_commands" not in st.session_state:
+        st.session_state.recovery_commands = ""
+    if "verification_commands" not in st.session_state:
+        st.session_state.verification_commands = ""
+    if "active_probe_logs" not in st.session_state:
+        st.session_state.active_probe_logs = {}  # device_id -> log(text)
+
+def _extract_first_codeblock_after_heading(markdown_text: str, heading_keyword: str) -> str:
+    """見出し（例: '復旧コマンド'）以降で最初に出現するコードブロックを抽出。"""
+    if not markdown_text:
+        return ""
+    # heading_keyword を含む行を探す（### ...）
+    lines = markdown_text.splitlines()
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if heading_keyword in line:
+            start_idx = i
+            break
+    # その後の ``` を探す
+    in_block = False
+    block_lines = []
+    for line in lines[start_idx:]:
+        if line.strip().startswith("```") and not in_block:
+            in_block = True
+            continue
+        if line.strip().startswith("```") and in_block:
+            break
+        if in_block:
+            block_lines.append(line)
+    return "\n".join(block_lines).strip()
+
+def _friendly_ai_error_message(e: Exception) -> str:
+    # 503/429 と APIキー系を切り分けて運用者に分かる形にする
+    msg = str(e)
+    cls = e.__class__.__name__
+    if isinstance(e, google_exceptions.ResourceExhausted) or "429" in msg:
+        return "AI API がレート制限（429）に達しました。短時間に連続実行していないか、同一APIキーの同時実行が多くないかを確認してください。"
+    if isinstance(e, google_exceptions.ServiceUnavailable) or "503" in msg:
+        return "AI API が一時的に 503（Service Unavailable）を返しています。サービス側の混雑/一時障害の可能性が高いです。少し間隔を空けて再試行してください。"
+    if isinstance(e, google_exceptions.Unauthenticated) or "401" in msg:
+        return "AI API の認証に失敗しました（401）。APIキーが未設定/誤りの可能性があります。"
+    if isinstance(e, google_exceptions.PermissionDenied) or "403" in msg:
+        return "AI API の権限エラー（403）です。APIキーの権限・プロジェクト設定・利用可能なモデルを確認してください。"
+    return f"AI API エラー: {cls}: {msg}"
 
 def render_topology(alarms, root_cause_candidates):
     """トポロジー図の描画 (AI判定結果を反映)"""
@@ -141,9 +316,25 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine"]:
-    if key not in st.session_state:
-        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
+_default_session_state = {
+    "live_result": None,
+    "messages": [],
+    "chat_session": None,
+    "trigger_analysis": False,
+    "verification_result": None,
+    "generated_report": None,
+    "verification_log": None,
+    "last_report_cand_id": None,
+    "logic_engine": None,
+    "recovery_commands": "",
+    "verification_commands": "",
+    "active_probe_logs": {},  # device_id -> log(text)
+}
+for k, v in _default_session_state.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+_ensure_cmd_state()
 
 # エンジン初期化
 if not st.session_state.logic_engine:
@@ -329,30 +520,43 @@ with col_map:
 
     st.markdown("---")
     st.subheader("🛠️ Auto-Diagnostics")
-    
     if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
         if not api_key:
             st.error("API Key Required")
         else:
+            # 診断対象は「現在選択中のインシデント（右の行選択）」を優先
+            diag_device_id = None
+            if selected_incident_candidate:
+                diag_device_id = selected_incident_candidate.get("id")
+            if not diag_device_id:
+                diag_device_id = target_device_id
+
+            target_node_obj = TOPOLOGY.get(diag_device_id) if diag_device_id else None
+
             with st.status("Agent Operating...", expanded=True) as status:
-                st.write("🔌 Connecting to device...")
-                target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
-                
+                st.write(f"🔌 Connecting to device... [{diag_device_id}]")
                 res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
                 st.session_state.live_result = res
-                
-                if res["status"] == "SUCCESS":
+
+                if res.get("status") == "SUCCESS":
                     st.write("✅ Log Acquired & Sanitized.")
                     status.update(label="Diagnostics Complete!", state="complete", expanded=False)
-                    log_content = res.get('sanitized_log', "")
+
+                    log_content = res.get("sanitized_log", "") or ""
+                    # 後段（レポート/修復プラン）に渡すために保持
+                    if diag_device_id:
+                        st.session_state.active_probe_logs[diag_device_id] = log_content
+
                     verification = verify_log_content(log_content)
                     st.session_state.verification_result = verification
                     st.session_state.trigger_analysis = True
-                elif res["status"] == "SKIPPED":
-                    status.update(label="No Action Required", state="complete")
+
+                elif res.get("status") == "SKIPPED":
+                    status.update(label="No Action Required", state="complete", expanded=False)
                 else:
-                    st.write("❌ Connection Failed.")
-                    status.update(label="Diagnostics Failed", state="error")
+                    st.write("❌ Connection Failed / No response.")
+                    status.update(label="Diagnostics Failed", state="error", expanded=True)
+
             st.rerun()
 
     if st.session_state.live_result:
@@ -391,134 +595,21 @@ with col_chat:
             
             if api_key and selected_scenario != "正常稼働":
                 if st.button("📝 詳細レポートを作成 (Generate Report)"):
-                    
-                    report_container = st.empty()
-                    target_conf = load_config_by_id(cand['id'])
-                    
-                    genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel("gemma-3-12b-it")
-
-                    verification_context = cand.get("verification_log", "特になし")
-
-                    # CI/トポロジー情報をレポート生成プロンプトに渡す
-                    t_node = TOPOLOGY.get(cand["id"])
-                    t_node_dict = asdict(t_node) if t_node else {}
-                    parent_id = t_node.parent_id if t_node else None
-                    children_ids = [
-                        nid for nid, n in TOPOLOGY.items()
-                        if getattr(n, "parent_id", None) == cand["id"]
-                    ]
-                    topology_context = {
-                        "node": t_node_dict,
-                        "parent_id": parent_id,
-                        "children_ids": children_ids,
-                    }
-
-                    prompt = f"""あなたはネットワーク運用監視のプロフェッショナルです。
-以下の障害インシデントについて、NOC/運用者向けの「状況報告レポート」を作成してください。
-
-【禁止事項】
-- 顧客向けの言い回しは禁止
-- 「原因究明と復旧作業を最優先で進めております」「進捗状況は随時ご報告いたします」等の定型句は禁止
-- 憶測で断定しない（推定は必ず根拠を併記）
-
-【入力情報】
-- 発生シナリオ: {selected_scenario}
-- 根本原因候補: {cand['id']} ({cand['label']})
-- リスクスコア: {cand['prob']*100:.0f}
-
-- CI/トポロジー情報(JSON):
-{json.dumps(topology_context, ensure_ascii=False, indent=2)}
-
-- 能動的診断結果(ログ/Reasoning):
-{verification_context}
-
-- 対象機器Config(抜粋):
-{target_conf[:1500]}
-
-【出力形式】
-HTMLタグは使用しない。Markdownのみ。
-文体は必ず「です／ます調」で統一してください。
-見出し（###）の前後は空行。
-
-### 運用状況報告：{cand['id']}
-
-**1. 観測事実**
-- （ログ、アラーム、IF状態など事実のみ）
-
-**2. 影響範囲（トポロジーから）**
-- 親: （parent_id があれば記載）
-- 子: （children_ids を列挙）
-- 影響の種類: north-south / east-west / 端末影響 などを、トポロジーと事実から判断して記載
-
-**3. 暫定原因と根拠**
-- 暫定原因候補: （Interface down / Provider / 装置 HW / 設定 など）
-- 根拠: （観測事実と紐づけ）
-
-**4. 次の確認コマンド**
-- 優先度順に、装置別に。
-- 例: show interface, show log, ping, traceroute, show bgp summary 等
-- コマンドの「期待結果」も併記
-
-**5. 切り分け手順（判断条件つき）**
-- もしAなら → 次にB
-- もしCなら → Provider エスカレーション条件、回線番号/IF名など記載
-
-**6. 復旧コマンド（実施前提・注意点）**
-- 実行候補の復旧コマンドを1つ以上提示してください。
-- コマンドは Markdown のコードブロック(```)で囲んでください。
-- shutdown/no shutdown、SFP/ケーブル差し替え、ルート切替、再起動は最終手段、など
-
-**7. 正常性確認コマンド（レポート用）**
-- 対応後に正常に戻ったかを確認するためのコマンドを3つ以上提示してください。
-- コマンドは Markdown のコードブロック(```)で囲んでください。
-"""
-
-                    try:
-                        response = generate_content_with_retry(model, prompt, stream=True)
-                        full_text = ""
-                        for chunk in response:
-                            if chunk.candidates[0].finish_reason == 1: 
-                                pass 
-                            elif chunk.candidates[0].finish_reason == 3: 
-                                full_text = "⚠️ コンテンツが安全フィルターによりブロックされました。別のシナリオを試してください。"
-                                break
-                            else:
-                                full_text += chunk.text
-                                report_container.markdown(full_text)
-                        
-                        if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
-                        st.session_state.generated_report = full_text
-                        st.session_state.last_report_cand_id = cand['id']
-                        _ensure_recovery_state()
-                        # レポートから復旧コマンドを抽出（見出しキーワードに依存）
-                        st.session_state.recovery_commands = (
-                            _extract_first_codeblock_after_heading(full_text, "復旧コマンド")
-                            or st.session_state.recovery_commands
-                        )
-                        st.session_state.verification_commands = (
-                            _extract_first_codeblock_after_heading(full_text, "正常性確認")
-                            or st.session_state.verification_commands
-                        )
-                        # セクション全文（期待結果などを保持するため）
-                        st.session_state.recovery_section_md = (
-                            _extract_section_after_heading(full_text, "復旧コマンド")
-                            or st.session_state.recovery_section_md
-                        )
-                        st.session_state.verification_section_md = (
-                            _extract_section_after_heading(full_text, "正常性確認")
-                            or st.session_state.verification_section_md
-                        )
-                        
-                    except Exception as e:
-                        err_msg = f"Report Generation Error: {str(e)}"
-                        st.session_state.generated_report = err_msg
-                        st.error("現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。")
-        else:
-            st.markdown(st.session_state.generated_report)
-            if st.button("🔄 レポート再作成"):
-                st.session_state.generated_report = None
-                st.rerun()
+                    _ensure_cmd_state()
+                    # LLM呼び出しは増やさない: レポートは Generate Fix の生成物を再利用する
+                    if st.session_state.get("bundle_cache") is None:
+                        st.session_state.bundle_cache = {}
+                    # 直近のバンドル生成物があればそれを表示
+                    bundle = st.session_state.get("last_bundle")
+                    if bundle and bundle.get("cand_id") == cand.get("id"):
+                        st.session_state.generated_report = bundle.get("report_md") or "レポートが未生成です。"
+                        st.session_state.last_report_cand_id = cand.get("id")
+                        # 併せてコマンドも再表示できるよう復元
+                        st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
+                        st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
+                        st.rerun()
+                    else:
+                        st.warning("詳細レポートは Generate Fix の生成物を再利用します。先に「修復プランを作成 (Generate Fix)」を実行してください。")
 
     # --- B. 自動修復 & チャット ---
     st.markdown("---")
@@ -535,9 +626,13 @@ HTMLタグは使用しない。Markdownのみ。
 
         if "remediation_plan" not in st.session_state:
             if st.button("✨ 修復プランを作成 (Generate Fix)"):
-                 if not api_key: st.error("API Key Required")
-                 else:
+                if not api_key:
+                    st.error("API Key Required")
+                else:
                     with st.spinner("Generating plan..."):
+                        _ensure_cmd_state()
+                        if st.session_state.get("bundle_cache") is None:
+                            st.session_state.bundle_cache = {}
                         t_node = TOPOLOGY.get(selected_incident_candidate["id"])
                         t_node_dict = asdict(t_node) if t_node else {}
                         parent_id = t_node.parent_id if t_node else None
@@ -550,37 +645,54 @@ HTMLタグは使用しない。Markdownのみ。
                             "parent_id": parent_id,
                             "children_ids": children_ids,
                         }
-
-                        analysis_blob = (
-                            "FORMAT REQUIREMENTS:\n"
-                            "- 出力は Markdown のみ\n"
-                            "- 『復旧コマンド』セクションと『正常性確認』セクションを必ず含める\n"
-                            "- 各セクションには『期待結果』(expected)を必ず含める\n"
-                            "- コマンドはコードブロック ``` で囲む\n"
-                            "- 期待結果は箇条書きで、合否判定基準が分かる形にする\n"
-                            "\n"
-                            f"Identified Root Cause: {selected_incident_candidate['label']}\n"
-                            f"Risk Score: {selected_incident_candidate['prob']*100:.0f}\n"
-                            f"---\n"
-                            f"Topology/CI Context (JSON):\n{json.dumps(topology_context, ensure_ascii=False, indent=2)}\n"
-                            f"---\n"
-                            f"Target Config (excerpt):\n{load_config_by_id(t_node.id)[:1500] if t_node else 'N/A'}\n"
+                        target_conf = load_config_by_id(selected_incident_candidate["id"])
+                        verification_context = (
+                            st.session_state.active_probe_logs.get(selected_incident_candidate["id"])
+                            or selected_incident_candidate.get("verification_log")
+                            or "特になし"
                         )
-
-                        plan_md = generate_remediation_commands(
+                        cache_key = "|".join([
                             selected_scenario,
-                            analysis_blob,
-                            t_node,
-                            api_key
-                        )
-
-                        _ensure_recovery_state()
-                        st.session_state.recovery_commands = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
-                        st.session_state.verification_commands = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
-                        st.session_state.recovery_section_md = _extract_section_after_heading(plan_md, "復旧コマンド")
-                        st.session_state.verification_section_md = _extract_section_after_heading(plan_md, "正常性確認")
-
-                        st.session_state.remediation_plan = plan_md
+                            str(selected_incident_candidate.get("id")),
+                            _stable_hash(json.dumps(topology_context, ensure_ascii=False, sort_keys=True)),
+                            _stable_hash(target_conf or ""),
+                            _stable_hash(verification_context or ""),
+                        ])
+                        if cache_key in st.session_state.bundle_cache:
+                            bundle = st.session_state.bundle_cache[cache_key]
+                        else:
+                            genai.configure(api_key=api_key)
+                            model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+                            prompt = _generate_bundle_prompt(selected_scenario, selected_incident_candidate, topology_context, target_conf, verification_context)
+                            try:
+                                response = generate_content_with_retry(model, prompt, stream=False)
+                                bundle_md = response.text if response else ""
+                            except Exception as e:
+                                bundle_md = f"Bundle Generation Error: {e}"
+                            report_md = _extract_section_by_h3(bundle_md, "運用状況報告")
+                            plan_md = _extract_section_by_h3(bundle_md, "復旧手順書") or bundle_md
+                            recovery_cmds = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
+                            verify_cmds = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
+                            expectations = _extract_expectations(bundle_md)
+                            bundle = {
+                                "cand_id": selected_incident_candidate.get("id"),
+                                "bundle_md": bundle_md,
+                                "report_md": report_md,
+                                "plan_md": plan_md,
+                                "recovery_cmds": recovery_cmds,
+                                "verify_cmds": verify_cmds,
+                                "expectations": expectations,
+                                "cache_key": cache_key,
+                                "created_at": time.time(),
+                            }
+                            st.session_state.bundle_cache[cache_key] = bundle
+                        # UI既存キーに同期（UX維持）
+                        st.session_state.last_bundle = bundle
+                        st.session_state.remediation_plan = bundle.get("plan_md")
+                        st.session_state.generated_report = bundle.get("report_md")
+                        st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
+                        st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
+                        st.session_state.expected_results = bundle.get("expectations")
                         st.rerun()
         
         if "remediation_plan" in st.session_state:
@@ -591,24 +703,22 @@ HTMLタグは使用しない。Markdownのみ。
             col_rec, col_exec1, col_exec2 = st.columns(3)
             
             with col_rec:
-                _ensure_recovery_state()
-                st.caption("🛠️ 復旧コマンド（固定表示）")
-                rec_text = st.session_state.recovery_section_md or "未生成です（Generate Fix / Generate Report を実行してください）。"
-                st.text_area("復旧コマンド", value=rec_text, height=180, disabled=True)
-
-                st.caption("🔎 正常性確認コマンド（固定表示）")
-                ver_text = st.session_state.verification_section_md or "未生成です（Generate Fix / Generate Report を実行してください）。"
-                st.text_area("正常性確認コマンド", value=ver_text, height=180, disabled=True)
+                if st.button("🛠️ 復旧コマンド", help="直近で生成された復旧コマンドを表示します"):
+                    _ensure_cmd_state()
+                    if st.session_state.get("recovery_commands"):
+                        st.markdown("#### 🛠️ Recovery Commands")
+                        st.code(st.session_state.recovery_commands, language="bash")
+                    else:
+                        st.warning("復旧コマンドが未生成です。先に Generate Fix または Generate Report を実行してください。")
 
             with col_exec1:
-
                 if st.button("🚀 修復実行 (Execute)", type="primary"):
                     if not api_key:
                         st.error("API Key Required")
                     else:
                         with st.status("Autonomic Remediation in progress...", expanded=True) as status:
                             st.write("⚙️ Applying Recovery Commands (simulated)...")
-                            _ensure_recovery_state()
+                            _ensure_cmd_state()
                             if st.session_state.get("recovery_commands"):
                                 st.code(st.session_state.recovery_commands, language="bash")
                             else:
@@ -617,69 +727,46 @@ HTMLタグは使用しない。Markdownのみ。
                             time.sleep(1.0)
 
                             st.write("🔎 Running Verification Commands (simulated)...")
-                            _ensure_recovery_state()
                             if st.session_state.get("verification_commands"):
                                 st.code(st.session_state.verification_commands, language="bash")
-                            else:
-                                st.info("正常性確認コマンドが未生成のため、検証フェーズは簡易表示になります。")
 
                             target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
-
-                            # 期待結果（合否判定基準）をAIに渡して、検証出力を生成（デモ用）
-                            expected_md = st.session_state.verification_section_md or ""
-                            verify_prompt = f"""あなたはネットワーク運用の検証担当です。
-以下の『正常性確認』を実行した体で、結果を出力してください（デモの疑似実行です）。
-
-【入力】
-- 対象機器: {selected_incident_candidate['id']}
-- 正常性確認コマンド:
-{st.session_state.verification_commands or '(none)'}
-- 期待結果/合否判定基準（参考）:
-{expected_md}
-
-【出力要件】
-- です／ます調
-- 各チェックは必ず [OK] または [NG] で始める
-- 最後に SUMMARY: PASS または SUMMARY: FAIL を1行で出す
-"""
-
-                            try:
-                                genai.configure(api_key=api_key)
-                                vmodel = genai.GenerativeModel("gemma-3-12b-it")
-                                vresp = vmodel.generate_content(verify_prompt)
-                                verification_log = (vresp.text or "").strip()
-                            except Exception:
-                                # フォールバック
-                                verification_log = "検証出力の生成に失敗しました（疑似実行）。\nSUMMARY: FAIL"
-
+                            device_id = (target_node_obj.id if target_node_obj else selected_incident_candidate['id'])
+                            verification_log = _simulate_verification_log(device_id, selected_scenario)
                             st.session_state.verification_log = verification_log
-                            st.code(verification_log, language="text")
-
-                            # 簡易合否判定（[NG] が1つでもあれば FAIL）
-                            ng_count = verification_log.count("[NG]")
-                            if "SUMMARY: FAIL" in verification_log or ng_count > 0:
-                                st.error(f"❌ Verification Result: FAIL（NG={ng_count}）")
-                            elif "SUMMARY: PASS" in verification_log:
-                                st.success("✅ Verification Result: PASS")
-                            else:
-                                st.warning("⚠️ Verification Result: UNKNOWN（要確認）")
+                            try:
+                                st.session_state.verification_result = verify_log_content(verification_log)
+                            except Exception:
+                                st.session_state.verification_result = None
+                            st.session_state.verification_log = verification_log
 
                             st.write("✅ Verification Completed.")
-
                             status.update(label="Process Finished", state="complete", expanded=False)
                         
                         st.success("Remediation Process Finished.")
 
+            
+
+
+
+            with col_exec_cmd:
+                show_disabled = not bool(st.session_state.get("recovery_commands"))
+                if st.button("📎 復旧コマンド", disabled=show_disabled):
+                    st.markdown("#### 🧩 Recovery Config（いつでも実行用）")
+                    st.code(st.session_state.get("recovery_commands", ""), language="bash")
+                    if st.session_state.get("verification_commands"):
+                        st.markdown("#### ✅ 正常性確認コマンド（参考）")
+                        st.code(st.session_state.get("verification_commands", ""), language="bash")
+
             with col_exec2:
-                 if st.button("キャンセル"):
+                if st.button("キャンセル"):
                     del st.session_state.remediation_plan
                     st.session_state.verification_log = None
                     st.rerun()
-            
+
             if st.session_state.get("verification_log"):
                 st.markdown("#### 🔎 Post-Fix Verification Logs")
                 st.code(st.session_state.verification_log, language="text")
-                
                 is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
                 
                 if is_success:
@@ -763,31 +850,8 @@ def _extract_first_codeblock_after_heading(md_text: str, heading_keyword: str):
             buf.append(line)
     return None
 
-
-def _extract_section_after_heading(md_text: str, heading_keyword: str):
-    """Markdown本文から、指定キーワードを含む見出し以降〜次の見出し直前までを返す。見つからなければ None。"""
-    if not md_text:
-        return None
-    lines = md_text.splitlines()
-    in_target = False
-    buf = []
-    for line in lines:
-        if line.strip().startswith("#"):
-            if in_target:
-                break
-            in_target = (heading_keyword in line)
-            continue
-        if in_target:
-            buf.append(line)
-    out = "\n".join(buf).strip()
-    return out or None
-
-def _ensure_recovery_state():
+def _ensure_cmd_state():
     if "recovery_commands" not in st.session_state:
         st.session_state.recovery_commands = None
     if "verification_commands" not in st.session_state:
         st.session_state.verification_commands = None
-    if "recovery_section_md" not in st.session_state:
-        st.session_state.recovery_section_md = None
-    if "verification_section_md" not in st.session_state:
-        st.session_state.verification_section_md = None
