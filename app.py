@@ -457,7 +457,14 @@ with col_chat:
 
                     # CI/トポロジー情報
                     t_node = TOPOLOGY.get(cand["id"])
-                    t_node_dict = asdict(t_node) if t_node else {}
+                    t_node_dict = {
+                        "id": getattr(t_node, "id", None),
+                        "type": getattr(t_node, "type", None),
+                        "layer": getattr(t_node, "layer", None),
+                        "metadata": getattr(t_node, "metadata", {}),
+                        "parent": getattr(t_node, "parent", None),
+                        "children": getattr(t_node, "children", []),
+                    } if t_node else {}
                     parent_id = t_node.parent_id if t_node else None
                     children_ids = [
                         nid for nid, n in TOPOLOGY.items()
