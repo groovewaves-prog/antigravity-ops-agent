@@ -124,7 +124,7 @@ def _extract_expectations(md_text: str) -> str:
     # fallback: 見出しが無い場合は空
     return ""
 
-def _generate_bundle_prompt(selected_scenario: str, cand: dict, topology_context: dict, target_conf: str, verification_context: str) -> str:
+def _generate_bundle_prompt(selected_scenario: str, cand: dict, topology_context: dict, target_conf: str, verification_context: str, force_polite_style: bool = False) -> str:
     return f"""あなたは熟練したネットワーク運用エンジニアです。
 以下の障害インシデントについて、**運用者向けの成果物を1つの回答にまとめて**作成してください。
 
@@ -596,20 +596,41 @@ with col_chat:
             if api_key and selected_scenario != "正常稼働":
                 if st.button("📝 詳細レポートを作成 (Generate Report)"):
                     _ensure_cmd_state()
-                    # LLM呼び出しは増やさない: レポートは Generate Fix の生成物を再利用する
                     if st.session_state.get("bundle_cache") is None:
                         st.session_state.bundle_cache = {}
-                    # 直近のバンドル生成物があればそれを表示
-                    bundle = st.session_state.get("last_bundle")
-                    if bundle and bundle.get("cand_id") == cand.get("id"):
-                        st.session_state.generated_report = bundle.get("report_md") or "レポートが未生成です。"
-                        st.session_state.last_report_cand_id = cand.get("id")
-                        # 併せてコマンドも再表示できるよう復元
-                        st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
-                        st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
-                        st.rerun()
-                    else:
-                        st.warning("詳細レポートは Generate Fix の生成物を再利用します。先に「修復プランを作成 (Generate Fix)」を実行してください。")
+                    t_node = TOPOLOGY.get(cand["id"])
+                    t_node_dict = asdict(t_node) if t_node else {}
+                    parent_id = t_node.parent_id if t_node else None
+                    children_ids = [nid for nid, n in TOPOLOGY.items() if getattr(n, "parent_id", None) == cand["id"]]
+                    topology_context = {"node": t_node_dict, "parent_id": parent_id, "children_ids": children_ids}
+                    target_conf = load_config_by_id(cand["id"])
+                    verification_context = st.session_state.active_probe_logs.get(cand["id"]) or cand.get("verification_log") or "特になし"
+                    cache_key = "|".join([selected_scenario, str(cand.get("id")), _hash_text(json.dumps(topology_context, ensure_ascii=False, sort_keys=True)), _hash_text(target_conf), _hash_text(verification_context)])
+                    bundle = st.session_state.bundle_cache.get(cache_key)
+                    if not bundle:
+                        prompt = _generate_bundle_prompt(selected_scenario, cand, topology_context, target_conf, verification_context, force_polite_style=True)
+                        try:
+                            response = generate_content_with_retry(model, prompt, stream=False)
+                            bundle_md = response.text if response else ""
+                        except Exception as e:
+                            st.error(f"LLM Error: {e}")
+                            st.stop()
+                        report_md = _extract_section_by_h3(bundle_md, "運用状況報告") or bundle_md
+                        plan_md = _extract_section_by_h3(bundle_md, "復旧手順書") or bundle_md
+                        recovery_cmds = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
+                        verify_cmds = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
+                        expectations = _extract_expectations(bundle_md)
+                        bundle = {"cand_id": cand.get("id"), "bundle_md": bundle_md, "report_md": report_md, "plan_md": plan_md, "recovery_cmds": recovery_cmds, "verify_cmds": verify_cmds, "expectations": expectations, "cache_key": cache_key, "created_at": time.time()}
+                        st.session_state.bundle_cache[cache_key] = bundle
+                    # UIキー同期
+                    st.session_state.last_bundle = bundle
+                    st.session_state.generated_report = bundle.get("report_md") or "レポートが未生成です。"
+                    st.session_state.last_report_cand_id = cand.get("id")
+                    st.session_state.remediation_plan = bundle.get("plan_md")
+                    st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
+                    st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
+                    st.session_state.expected_results = bundle.get("expectations")
+                    st.rerun()
 
     # --- B. 自動修復 & チャット ---
     st.markdown("---")
@@ -625,77 +646,18 @@ with col_chat:
         """, unsafe_allow_html=True)
 
         if "remediation_plan" not in st.session_state:
-            if st.button("✨ 修復プランを作成 (Generate Fix)"):
-                if not api_key:
-                    st.error("API Key Required")
+            if st.button("✨ 修復プランを作成 (Generate Fix)", disabled=not bool(st.session_state.get("generated_report"))):
+                _ensure_cmd_state()
+                cand = selected_incident_candidate
+                bundle = st.session_state.get('last_bundle')
+                if not bundle or bundle.get('cand_id') != cand.get('id'):
+                    st.warning('先に「詳細レポートを作成 (Generate Report)」を実行してください。')
                 else:
-                    with st.spinner("Generating plan..."):
-                        _ensure_cmd_state()
-                        if st.session_state.get("bundle_cache") is None:
-                            st.session_state.bundle_cache = {}
-                        t_node = TOPOLOGY.get(selected_incident_candidate["id"])
-                        t_node_dict = asdict(t_node) if t_node else {}
-                        parent_id = t_node.parent_id if t_node else None
-                        children_ids = [
-                            nid for nid, n in TOPOLOGY.items()
-                            if getattr(n, "parent_id", None) == selected_incident_candidate["id"]
-                        ]
-                        topology_context = {
-                            "node": t_node_dict,
-                            "parent_id": parent_id,
-                            "children_ids": children_ids,
-                        }
-                        target_conf = load_config_by_id(selected_incident_candidate["id"])
-                        verification_context = (
-                            st.session_state.active_probe_logs.get(selected_incident_candidate["id"])
-                            or selected_incident_candidate.get("verification_log")
-                            or "特になし"
-                        )
-                        cache_key = "|".join([
-                            selected_scenario,
-                            str(selected_incident_candidate.get("id")),
-                            _stable_hash(json.dumps(topology_context, ensure_ascii=False, sort_keys=True)),
-                            _stable_hash(target_conf or ""),
-                            _stable_hash(verification_context or ""),
-                        ])
-                        if cache_key in st.session_state.bundle_cache:
-                            bundle = st.session_state.bundle_cache[cache_key]
-                        else:
-                            genai.configure(api_key=api_key)
-                            model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
-                            prompt = _generate_bundle_prompt(selected_scenario, selected_incident_candidate, topology_context, target_conf, verification_context)
-                            try:
-                                response = generate_content_with_retry(model, prompt, stream=False)
-                                bundle_md = response.text if response else ""
-                            except Exception as e:
-                                bundle_md = f"Bundle Generation Error: {e}"
-                            report_md = _extract_section_by_h3(bundle_md, "運用状況報告")
-                            plan_md = _extract_section_by_h3(bundle_md, "復旧手順書") or bundle_md
-                            recovery_cmds = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
-                            verify_cmds = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
-                            expectations = _extract_expectations(bundle_md)
-                            bundle = {
-                                "cand_id": selected_incident_candidate.get("id"),
-                                "bundle_md": bundle_md,
-                                "report_md": report_md,
-                                "plan_md": plan_md,
-                                "recovery_cmds": recovery_cmds,
-                                "verify_cmds": verify_cmds,
-                                "expectations": expectations,
-                                "cache_key": cache_key,
-                                "created_at": time.time(),
-                            }
-                            st.session_state.bundle_cache[cache_key] = bundle
-                        # UI既存キーに同期（UX維持）
-                        st.session_state.last_bundle = bundle
-                        st.session_state.remediation_plan = bundle.get("plan_md")
-                        st.session_state.generated_report = bundle.get("report_md")
-                        st.session_state.recovery_commands = bundle.get("recovery_cmds") or st.session_state.recovery_commands
-                        st.session_state.verification_commands = bundle.get("verify_cmds") or st.session_state.verification_commands
-                        st.session_state.expected_results = bundle.get("expectations")
-                        st.rerun()
-        
-        if "remediation_plan" in st.session_state:
+                    st.session_state.remediation_plan = bundle.get('plan_md') or bundle.get('bundle_md')
+                    st.session_state.recovery_commands = bundle.get('recovery_cmds') or st.session_state.recovery_commands
+                    st.session_state.verification_commands = bundle.get('verify_cmds') or st.session_state.verification_commands
+                    st.session_state.expected_results = bundle.get('expectations')
+                    st.success('修復プランを準備しました。')
             with st.container(border=True):
                 st.info("AI Generated Recovery Procedure")
                 st.markdown(st.session_state.remediation_plan)
