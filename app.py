@@ -2,9 +2,10 @@ import streamlit as st
 import graphviz
 import os
 import time
+import random
 import google.generativeai as genai
 import json
-import re
+from dataclasses import asdict
 import pandas as pd
 from google.api_core import exceptions as google_exceptions
 
@@ -47,222 +48,88 @@ def load_config_by_id(device_id):
                 pass
     return "Config file not found."
 
-def generate_content_with_retry(model, prompt, stream=True, retries=3):
-    """503エラー対策のリトライ付き生成関数"""
+def generate_content_with_retry(model, prompt, stream=True, retries=5, base_sleep=1.5, max_sleep=12.0):
+    """Gemini呼び出しのリトライ（503/429/一時障害）とエラーメッセージ整形。
+    - ServiceUnavailable(503), ResourceExhausted(429) を主対象に指数バックオフで再試行
+    - stream=True の場合も同様に generate_content を呼び出す（返り値は iterator ）
+    """
+    last_exc = None
     for i in range(retries):
         try:
             return model.generate_content(prompt, stream=stream)
-        except google_exceptions.ServiceUnavailable:
-            if i == retries - 1: raise
-            time.sleep(2 * (i + 1))
-    return None
+        except (
+            google_exceptions.ServiceUnavailable,
+            google_exceptions.ResourceExhausted,
+            google_exceptions.DeadlineExceeded,
+            google_exceptions.InternalServerError,
+        ) as e:
+            # 典型的には「混雑」「一時的な内部障害」「レート制限」
+            last_exc = e
+            if i == retries - 1:
+                raise
+            # exponential backoff + small jitter
+            sleep_s = min(max_sleep, base_sleep * (2 ** i)) * (0.85 + random.random() * 0.3)
+            time.sleep(sleep_s)
+        except (
+            google_exceptions.Unauthenticated,
+            google_exceptions.PermissionDenied,
+            google_exceptions.InvalidArgument,
+        ) as e:
+            # APIキー/権限/リクエスト不正はリトライしても改善しにくい
+            raise
+        except Exception as e:
+            last_exc = e
+            if i == retries - 1:
+                raise
+            time.sleep(min(max_sleep, base_sleep * (2 ** i)))
+    raise last_exc if last_exc else RuntimeError("Unknown generation error")
 
-
-def _pick_first(mapping: dict, keys: list[str], default: str = "") -> str:
-    """Return the first non-empty value for the given keys from mapping (stringify scalars)."""
-    for k in keys:
-        try:
-            v = mapping.get(k, None)
-        except Exception:
-            v = None
-        if v is None:
-            continue
-        if isinstance(v, (int, float, bool)):
-            s = str(v)
-            if s:
-                return s
-        elif isinstance(v, str):
-            if v.strip():
-                return v.strip()
-        else:
-            # for non-string, try json
-            try:
-                s = json.dumps(v, ensure_ascii=False)
-                if s and s != "null":
-                    return s
-            except Exception:
-                continue
-    return default
-
-
-def _build_ci_context_for_chat(target_node_id: str) -> dict:
-    """チャット用のCIコンテキストを最小限で構築します（CI/Configをフル活用、キー揺れを吸収）。"""
-    node = TOPOLOGY.get(target_node_id) if target_node_id else None
-    md = (getattr(node, "metadata", None) or {}) if node else {}
-
-    ci = {
-        "device_id": target_node_id or "",
-        "hostname": _pick_first(md, ["hostname", "host", "name"], default=(target_node_id or "")),
-        "vendor": _pick_first(md, ["vendor", "manufacturer", "maker", "brand"], default=""),
-        "os": _pick_first(md, ["os", "platform", "os_name", "software", "sw"], default=""),
-        "model": _pick_first(md, ["model", "hw_model", "product", "sku"], default=""),
-        "role": _pick_first(md, ["role", "type", "device_role"], default=""),
-        "layer": _pick_first(md, ["layer", "level", "network_layer"], default=""),
-        "site": _pick_first(md, ["site", "dc", "datacenter", "location"], default=""),
-        "tenant": _pick_first(md, ["tenant", "customer", "org", "company"], default=""),
-        "mgmt_ip": _pick_first(md, ["mgmt_ip", "management_ip", "management", "oob_ip"], default=""),
-        "interfaces": md.get("interfaces", ""),
-    }
-
-    # Config は長いので抜粋（存在すれば最大1500文字）
-    try:
-        conf = load_config_by_id(target_node_id) if target_node_id else ""
-        if conf:
-            ci["config_excerpt"] = conf[:1500]
-    except Exception:
-        pass
-
-    return ci
-
-
-def _safe_chunk_text(chunk) -> str:
-    """google.generativeai の stream chunk から安全にテキストを取り出します。"""
-    # chunk.text は ValueError になり得る
-    try:
-        t = getattr(chunk, "text", "")
-        if t:
-            return t
-    except Exception:
-        pass
-
-    # candidates -> content -> parts から拾う
-    try:
-        cands = getattr(chunk, "candidates", None) or []
-        if not cands:
-            return ""
-        content = getattr(cands[0], "content", None)
-        parts = getattr(content, "parts", None) or []
-        out = []
-        for p in parts:
-            tx = getattr(p, "text", "")
-            if tx:
-                out.append(tx)
-        return "".join(out)
-    except Exception:
-        return ""
-
-
-
-
-def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
-    """LLMを呼ばない疑似診断（503/コスト対策）。UXは維持しつつ、材料を増やすためのログを生成します。
-    重要: 「修復実行(Execute)」で復旧成功した後は、同一シナリオに限り成功側の疑似ログを返します。
-    """
-    device_id = getattr(target_node_obj, "id", "UNKNOWN") if target_node_obj else "UNKNOWN"
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    lines = [
-        f"[PROBE] ts={ts}",
-        f"[PROBE] scenario={selected_scenario}",
-        f"[PROBE] target_device={device_id}",
-        "",
-    ]
-
-    # 復旧成功フラグ（デモ用）
-    recovered_devices = st.session_state.get("recovered_devices") or {}
-    recovered_map = st.session_state.get("recovered_scenario_map") or {}
-
-    if recovered_devices.get(device_id) and recovered_map.get(device_id) == selected_scenario:
-        # “復旧後”の疑似ログ（成功）
-        if "FW" in selected_scenario:
-            lines += [
-                "show chassis cluster status",
-                "Redundancy group 0: healthy",
-                "control link: up",
-                "fabric link: up",
-            ]
-        elif "WAN" in selected_scenario or "WAN全回線断" in selected_scenario:
-            lines += [
-                "show ip interface brief",
-                "GigabitEthernet0/0 up up",
-                "show ip bgp summary",
-                "Neighbor 203.0.113.2 Established",
-                "ping 203.0.113.2 repeat 5",
-                "Success rate is 100 percent (5/5)",
-            ]
-        elif "L2SW" in selected_scenario:
-            lines += [
-                "show environment",
-                "Fan: OK",
-                "Temperature: OK",
-                "show interface status",
-                "Uplink: up",
-            ]
-        else:
-            lines += [
-                "show system alarms",
-                "No active alarms",
-                "ping 8.8.8.8 repeat 5",
-                "Success rate is 100 percent (5/5)",
-            ]
-
-        return {
-            "status": "SUCCESS",
-            "sanitized_log": "\n".join(lines),
-            "verification_log": "N/A",
-            "device_id": device_id,
-        }
-
-    # “障害中”の疑似ログ（現状維持）
-    if "WAN全回線断" in selected_scenario or "[WAN]" in selected_scenario:
-        lines += [
-            "show ip interface brief",
-            "GigabitEthernet0/0 down down",
-            "show ip bgp summary",
-            "Neighbor 203.0.113.2 Idle",
-            "ping 203.0.113.2 repeat 5",
-            "Success rate is 0 percent (0/5)",
-        ]
-    elif "FW片系障害" in selected_scenario or "[FW]" in selected_scenario:
-        lines += [
-            "show chassis cluster status",
-            "Redundancy group 0: degraded",
-            "control link: down",
-            "fabric link: up",
-        ]
-    elif "L2SW" in selected_scenario:
-        lines += [
-            "show environment",
-            "Fan: FAIL",
-            "Temperature: HIGH",
-            "show interface status",
-            "Uplink: flapping",
-        ]
-    else:
-        lines += [
-            "show system alarms",
-            "No active alarms",
-        ]
-
-    return {
-        "status": "SUCCESS",
-        "sanitized_log": "\n".join(lines),
-        "verification_log": "N/A",
-        "device_id": device_id,
-    }
-
-
-def _hash_text(text: str) -> str:
-    import hashlib
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+def _ensure_cmd_state():
+    if "recovery_commands" not in st.session_state:
+        st.session_state.recovery_commands = ""
+    if "verification_commands" not in st.session_state:
+        st.session_state.verification_commands = ""
+    if "active_probe_logs" not in st.session_state:
+        st.session_state.active_probe_logs = {}  # device_id -> log(text)
 
 def _extract_first_codeblock_after_heading(markdown_text: str, heading_keyword: str) -> str:
-    """Extract the first fenced code block (``` ... ```) that appears *after* a heading containing heading_keyword.
-    - Returns code content without fences.
-    - If not found, returns empty string.
-    This is intentionally simple and robust to avoid complex parsing / IF sprawl.
-    """
-    if not markdown_text or not heading_keyword:
+    """見出し（例: '復旧コマンド'）以降で最初に出現するコードブロックを抽出。"""
+    if not markdown_text:
         return ""
-    # Find the heading position (supports '#', '##', etc. and also plain text headings)
-    idx = markdown_text.find(heading_keyword)
-    if idx < 0:
-        return ""
-    tail = markdown_text[idx:]
-    # Find first fenced code block after the heading
-    m = re.search(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)\n```", tail, flags=re.DOTALL)
-    if not m:
-        return ""
-    return (m.group(1) or "").strip()
+    # heading_keyword を含む行を探す（### ...）
+    lines = markdown_text.splitlines()
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if heading_keyword in line:
+            start_idx = i
+            break
+    # その後の ``` を探す
+    in_block = False
+    block_lines = []
+    for line in lines[start_idx:]:
+        if line.strip().startswith("```") and not in_block:
+            in_block = True
+            continue
+        if line.strip().startswith("```") and in_block:
+            break
+        if in_block:
+            block_lines.append(line)
+    return "\n".join(block_lines).strip()
+
+def _friendly_ai_error_message(e: Exception) -> str:
+    # 503/429 と APIキー系を切り分けて運用者に分かる形にする
+    msg = str(e)
+    cls = e.__class__.__name__
+    if isinstance(e, google_exceptions.ResourceExhausted) or "429" in msg:
+        return "AI API がレート制限（429）に達しました。短時間に連続実行していないか、同一APIキーの同時実行が多くないかを確認してください。"
+    if isinstance(e, google_exceptions.ServiceUnavailable) or "503" in msg:
+        return "AI API が一時的に 503（Service Unavailable）を返しています。サービス側の混雑/一時障害の可能性が高いです。少し間隔を空けて再試行してください。"
+    if isinstance(e, google_exceptions.Unauthenticated) or "401" in msg:
+        return "AI API の認証に失敗しました（401）。APIキーが未設定/誤りの可能性があります。"
+    if isinstance(e, google_exceptions.PermissionDenied) or "403" in msg:
+        return "AI API の権限エラー（403）です。APIキーの権限・プロジェクト設定・利用可能なモデルを確認してください。"
+    return f"AI API エラー: {cls}: {msg}"
+
 def render_topology(alarms, root_cause_candidates):
     """トポロジー図の描画 (AI判定結果を反映)"""
     graph = graphviz.Digraph()
@@ -347,16 +214,25 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map"]:
-    if key not in st.session_state:
-        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
+_default_session_state = {
+    "live_result": None,
+    "messages": [],
+    "chat_session": None,
+    "trigger_analysis": False,
+    "verification_result": None,
+    "generated_report": None,
+    "verification_log": None,
+    "last_report_cand_id": None,
+    "logic_engine": None,
+    "recovery_commands": "",
+    "verification_commands": "",
+    "active_probe_logs": {},  # device_id -> log(text)
+}
+for k, v in _default_session_state.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-
-# 復旧状態（デモ用）
-if "recovered_devices" not in st.session_state:
-    st.session_state.recovered_devices = {}
-if "recovered_scenario_map" not in st.session_state:
-    st.session_state.recovered_scenario_map = {}
+_ensure_cmd_state()
 
 # エンジン初期化
 if not st.session_state.logic_engine:
@@ -365,9 +241,6 @@ if not st.session_state.logic_engine:
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
     st.session_state.current_scenario = selected_scenario
-    # シナリオ変更時は復旧フラグもクリア（未修復なのにOKになるのを防ぐ）
-    st.session_state.recovered_devices = {}
-    st.session_state.recovered_scenario_map = {}
     st.session_state.messages = []      
     st.session_state.chat_session = None 
     st.session_state.live_result = None 
@@ -545,31 +418,43 @@ with col_map:
 
     st.markdown("---")
     st.subheader("🛠️ Auto-Diagnostics")
-    
     if st.button("🚀 診断実行 (Run Diagnostics)", type="primary"):
         if not api_key:
             st.error("API Key Required")
         else:
+            # 診断対象は「現在選択中のインシデント（右の行選択）」を優先
+            diag_device_id = None
+            if selected_incident_candidate:
+                diag_device_id = selected_incident_candidate.get("id")
+            if not diag_device_id:
+                diag_device_id = target_device_id
+
+            target_node_obj = TOPOLOGY.get(diag_device_id) if diag_device_id else None
+
             with st.status("Agent Operating...", expanded=True) as status:
-                st.write("🔌 Connecting to device...")
-                target_node_obj = TOPOLOGY.get(target_device_id) if target_device_id else None
-                is_live_mode = bool(st.session_state.get('api_connected')) and ('[Live]' in selected_scenario or 'Live' in selected_scenario)
-                
-                res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key) if is_live_mode else run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj)
+                st.write(f"🔌 Connecting to device... [{diag_device_id}]")
+                res = run_diagnostic_simulation(selected_scenario, target_node_obj, api_key)
                 st.session_state.live_result = res
-                
-                if res["status"] == "SUCCESS":
+
+                if res.get("status") == "SUCCESS":
                     st.write("✅ Log Acquired & Sanitized.")
                     status.update(label="Diagnostics Complete!", state="complete", expanded=False)
-                    log_content = res.get('sanitized_log', "")
+
+                    log_content = res.get("sanitized_log", "") or ""
+                    # 後段（レポート/修復プラン）に渡すために保持
+                    if diag_device_id:
+                        st.session_state.active_probe_logs[diag_device_id] = log_content
+
                     verification = verify_log_content(log_content)
                     st.session_state.verification_result = verification
                     st.session_state.trigger_analysis = True
-                elif res["status"] == "SKIPPED":
-                    status.update(label="No Action Required", state="complete")
+
+                elif res.get("status") == "SKIPPED":
+                    status.update(label="No Action Required", state="complete", expanded=False)
                 else:
-                    st.write("❌ Connection Failed.")
-                    status.update(label="Diagnostics Failed", state="error")
+                    st.write("❌ Connection Failed / No response.")
+                    status.update(label="Diagnostics Failed", state="error", expanded=True)
+
             st.rerun()
 
     if st.session_state.live_result:
@@ -615,93 +500,85 @@ with col_chat:
                     genai.configure(api_key=api_key)
                     model = genai.GenerativeModel("gemma-3-12b-it")
 
-                    verification_context = cand.get("verification_log", "特になし")
-                    target_conf = load_config_by_id(cand['id'])
+                    verification_context = st.session_state.active_probe_logs.get(cand["id"]) or cand.get("verification_log") or "特になし"
 
-                    # CI/トポロジー情報
+                    # CI/トポロジー情報をレポート生成プロンプトに渡す
                     t_node = TOPOLOGY.get(cand["id"])
-                    t_node_dict = {
-    "id": getattr(t_node, "id", None),
-    "type": getattr(t_node, "type", None),
-    "layer": getattr(t_node, "layer", None),
-    "metadata": getattr(t_node, "metadata", {}) or {},
-    "parent": getattr(t_node, "parent", None),
-    "children": getattr(t_node, "children", []) or [],
-} if t_node else {}
-
+                    t_node_dict = asdict(t_node) if t_node else {}
                     parent_id = t_node.parent_id if t_node else None
                     children_ids = [
                         nid for nid, n in TOPOLOGY.items()
                         if getattr(n, "parent_id", None) == cand["id"]
                     ]
-                    topology_context = {"node": t_node_dict, "parent_id": parent_id, "children_ids": children_ids}
+                    topology_context = {
+                        "node": t_node_dict,
+                        "parent_id": parent_id,
+                        "children_ids": children_ids,
+                    }
 
-                    cache_key = "|".join([
-                        selected_scenario,
-                        str(cand.get("id")),
-                        _hash_text(json.dumps(topology_context, ensure_ascii=False, sort_keys=True)),
-                        _hash_text(target_conf or ""),
-                        _hash_text(verification_context or ""),
-                    ])
+                    prompt = f"""あなたはネットワーク運用監視のプロフェッショナルです。
+                    以下の障害インシデントについて、NOC/運用者向けの「原因分析レポート（原因のみ）」を作成してください。
 
-                    if "report_cache" not in st.session_state:
-                        st.session_state.report_cache = {}
+                    【禁止事項】
+                    - 顧客向けの言い回しは禁止
+                    - 「原因究明と復旧作業を最優先で進めております」「進捗状況は随時ご報告いたします」等の定型句は禁止
+                    - 憶測で断定しない（推定は必ず根拠を併記）
+                    - 復旧コマンド/復旧手順/正常性確認コマンドは **一切** 出力しない（それらは Remediation で作成）
 
-                    if cache_key in st.session_state.report_cache:
-                        full_text = st.session_state.report_cache[cache_key]
-                        report_container.markdown(full_text)
-                    else:
-                        prompt = f"""
-あなたはネットワーク運用者向けのAI分析官です。以下の事実（CI情報/トポロジー/config/ログ）から、運用者が作業に使える状況報告を作成してください。
+                    【入力データ】
+                    - シナリオ: {selected_scenario}
+                    - インシデント候補: id={cand["id"]}, label={cand["label"]}, risk={cand["prob"]*100:.0f}
+                    - CI/トポロジー(抜粋JSON): {json.dumps(topology_context, ensure_ascii=False)}
+                    - Config抜粋: {target_conf[:1800] if target_conf else "N/A"}
+                    - 診断ログ(あれば): {verification_context}
 
-文体:
-- 必ず「です/ます調」で統一してください。
+                    【出力フォーマット】（です/ます調）
+                    ### 原因分析レポート：{cand["id"]}
 
-禁止:
-- 「現在、原因究明と復旧作業を最優先で進めております」
-- 「進捗状況は随時、ご報告いたします」
-- 「検討を加速させます」
-などの対外向け定型句は書かないでください。
+                    **1. 観測事実（事実のみ）**
+                    - アラーム/ログ/IF状態/疎通結果など（入力データにあるものだけ）
 
-不明点:
-- 不明な点は「未確認」とし、推測は「推定」と明示してください。
+                    **2. 影響範囲（トポロジーから）**
+                    - 親: {parent_id if parent_id else "なし"}
+                    - 子: {", ".join(children_ids) if children_ids else "なし"}
+                    - 影響の種類（north-south / east-west / 端末影響 など）を、トポロジーと観測事実から判断して記載
 
-出力:
-- Markdown
-- 次の章立てを必ず含めてください（見出し文言を変更しない）:
-1. 障害概要
-2. 影響
-3. 詳細情報
-4. 対応と特定根拠
-5. 今後の対応
-6. 復旧コマンド（実施前提・注意点）
-7. 正常性確認コマンド（レポート用）
+                    **3. 暫定原因（候補）と根拠**
+                    - 候補を優先度順に最大3件（例: Interface down / Provider / 装置HW / 設定）
+                    - 各候補に「根拠（観測事実との対応）」を必ず併記
 
-入力:
-- シナリオ: {selected_scenario}
-- 対象機器ID: {cand['id']}
-- CI/トポロジー: {json.dumps(topology_context, ensure_ascii=False)}
-- Config(抜粋): {(target_conf or 'なし')[:2000]}
-- 検証ログ: {verification_context}
+                    **4. 追加で必要な確認（コマンド名のみ）**
+                    - 優先度順に列挙（例: show interface, show log, show bgp summary, traceroute など）
+                    - コマンドの実行結果が「どの候補の切り分けに効くか」を1行で添える
 
-コマンドは必ず ``` のコードブロックで囲んでください。
-"""
+                    **5. 切り分け判断（条件分岐）**
+                    - もしAなら → 次にB
+                    - もしCなら → Provider エスカレーション条件（回線番号/IF名が分かれば含める）
 
-                        try:
-                            response = generate_content_with_retry(model, prompt, stream=False)
-                            full_text = response.text if hasattr(response, "text") and response.text else str(response)
-                            if not full_text:
-                                full_text = "レポート生成に失敗しました（空の応答）。"
-                            report_container.markdown(full_text)
-                            st.session_state.report_cache[cache_key] = full_text
-                        except google_exceptions.ServiceUnavailable:
-                            full_text = "⚠️ 現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。"
-                            report_container.markdown(full_text)
-                        except Exception as e:
-                            full_text = f"レポート生成に失敗しました: {type(e).__name__}: {e}"
-                            report_container.markdown(full_text)
+                    """
 
-                    st.session_state.generated_report = full_text
+                    try:
+                        response = generate_content_with_retry(model, prompt, stream=True)
+                        full_text = ""
+                        for chunk in response:
+                            if chunk.candidates[0].finish_reason == 1: 
+                                pass 
+                            elif chunk.candidates[0].finish_reason == 3: 
+                                full_text = "⚠️ コンテンツが安全フィルターによりブロックされました。別のシナリオを試してください。"
+                                break
+                            else:
+                                full_text += chunk.text
+                                report_container.markdown(full_text)
+                        
+                        if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
+                        st.session_state.generated_report = full_text
+                        st.session_state.last_report_cand_id = cand['id']
+                        _ensure_cmd_state()
+                        # NOTE: レポートは原因分析のみ（復旧/確認コマンドは Remediation で生成）
+                    except Exception as e:
+                        err_msg = f"Report Generation Error: {str(e)}"
+                        st.session_state.generated_report = err_msg
+                        st.error(_friendly_ai_error_message(e))
         else:
             st.markdown(st.session_state.generated_report)
             if st.button("🔄 レポート再作成"):
@@ -723,59 +600,118 @@ with col_chat:
 
         if "remediation_plan" not in st.session_state:
             if st.button("✨ 修復プランを作成 (Generate Fix)"):
-                 if "generated_report" not in st.session_state or not st.session_state.generated_report:
-                     st.warning("先に「📝 詳細レポートを作成 (Generate Report)」を実行してください。")
-                 else:
-                     plan_md = st.session_state.generated_report
-                     st.session_state.recovery_commands = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
-                     st.session_state.verification_commands = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
-                     st.session_state.remediation_plan = plan_md
-                     st.rerun()
+                if not api_key:
+                    st.error("API Key Required")
+                else:
+                    with st.spinner("Generating plan..."):
+                        t_node = TOPOLOGY.get(selected_incident_candidate["id"])
+                        t_node_dict = asdict(t_node) if t_node else {}
+                        parent_id = t_node.parent_id if t_node else None
+                        children_ids = [
+                            nid for nid, n in TOPOLOGY.items()
+                            if getattr(n, "parent_id", None) == selected_incident_candidate["id"]
+                        ]
+                        topology_context = {
+                            "node": t_node_dict,
+                            "parent_id": parent_id,
+                            "children_ids": children_ids,
+                        }
+
+                        analysis_blob = (
+                            f"Identified Root Cause: {selected_incident_candidate['label']}\\n"
+                            f"Risk Score: {selected_incident_candidate['prob']*100:.0f}\\n"
+                            f"---\\n"
+                            f"Topology/CI Context (JSON):\\n{json.dumps(topology_context, ensure_ascii=False, indent=2)}\\n"
+                            f"---\\n"
+                            f"Target Config (excerpt):\\n{load_config_by_id(t_node.id)[:1500] if t_node else 'N/A'}\\n"
+                        )
+
+                        plan_md = generate_remediation_commands(
+                            selected_scenario,
+                            analysis_blob,
+                            t_node,
+                            api_key
+                        )
+
+                        if isinstance(plan_md, str) and ("503" in plan_md or "ServiceUnavailable" in plan_md or "ResourceExhausted" in plan_md):
+                            st.error("修復プラン生成で一時的なAI APIエラーが発生しました。少し間隔を空けて再試行してください。")
+
+                        _ensure_cmd_state()
+                        st.session_state.recovery_commands = _extract_first_codeblock_after_heading(plan_md, "復旧コマンド")
+                        st.session_state.verification_commands = _extract_first_codeblock_after_heading(plan_md, "正常性確認")
+
+                        st.session_state.remediation_plan = plan_md
+                        st.rerun()
         
         if "remediation_plan" in st.session_state:
             with st.container(border=True):
                 st.info("AI Generated Recovery Procedure")
                 st.markdown(st.session_state.remediation_plan)
             
-            col_exec1, col_exec2 = st.columns(2)
+            col_rec, col_exec1, col_exec2 = st.columns(3)
             
+            with col_rec:
+                if st.button("🛠️ 復旧コマンド", help="直近で生成された復旧コマンドを表示します"):
+                    _ensure_cmd_state()
+                    if st.session_state.get("recovery_commands"):
+                        st.markdown("#### 🛠️ Recovery Commands")
+                        st.code(st.session_state.recovery_commands, language="bash")
+                    else:
+                        st.warning("復旧コマンドが未生成です。先に Generate Fix を実行してください。")
+
             with col_exec1:
                 if st.button("🚀 修復実行 (Execute)", type="primary"):
                     if not api_key:
                         st.error("API Key Required")
                     else:
                         with st.status("Autonomic Remediation in progress...", expanded=True) as status:
-                            st.write("⚙️ Applying Configuration...")
-                            time.sleep(1.5) 
-                            
-                            st.write("🔎 Running Verification Commands...")
+                            st.write("⚙️ Applying Recovery Commands (simulated)...")
+                            _ensure_cmd_state()
+                            if st.session_state.get("recovery_commands"):
+                                st.code(st.session_state.recovery_commands, language="bash")
+                            else:
+                                st.info("復旧コマンドは未生成のため、適用フェーズはスキップします。")
+
+                            time.sleep(1.0)
+
+                            st.write("🔎 Running Verification Commands (simulated)...")
+                            if st.session_state.get("verification_commands"):
+                                st.code(st.session_state.verification_commands, language="bash")
+
                             target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
                             verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
                             st.session_state.verification_log = verification_log
-                            
+
                             st.write("✅ Verification Completed.")
                             status.update(label="Process Finished", state="complete", expanded=False)
                         
                         st.success("Remediation Process Finished.")
 
+            
+
+
+
+            with col_exec_cmd:
+                show_disabled = not bool(st.session_state.get("recovery_commands"))
+                if st.button("📎 復旧コマンド", disabled=show_disabled):
+                    st.markdown("#### 🧩 Recovery Config（いつでも実行用）")
+                    st.code(st.session_state.get("recovery_commands", ""), language="bash")
+                    if st.session_state.get("verification_commands"):
+                        st.markdown("#### ✅ 正常性確認コマンド（参考）")
+                        st.code(st.session_state.get("verification_commands", ""), language="bash")
+
             with col_exec2:
-                 if st.button("キャンセル"):
+                if st.button("キャンセル"):
                     del st.session_state.remediation_plan
                     st.session_state.verification_log = None
                     st.rerun()
-            
+
             if st.session_state.get("verification_log"):
                 st.markdown("#### 🔎 Post-Fix Verification Logs")
                 st.code(st.session_state.verification_log, language="text")
-                
                 is_success = "up" in st.session_state.verification_log.lower() or "ok" in st.session_state.verification_log.lower()
                 
                 if is_success:
-                    # 復旧成功フラグ（デモ用）。次回の「診断実行」で成功側の疑似ログを返します。
-                    st.session_state.recovered_devices = st.session_state.get("recovered_devices") or {}
-                    st.session_state.recovered_scenario_map = st.session_state.get("recovered_scenario_map") or {}
-                    st.session_state.recovered_devices[target_device_id] = True
-                    st.session_state.recovered_scenario_map[target_device_id] = selected_scenario
                     st.balloons()
                     st.success("✅ System Recovered Successfully!")
                 else:
@@ -797,41 +733,6 @@ with col_chat:
 
     # チャット (常時表示)
     with st.expander("💬 Chat with AI Agent", expanded=False):
-        # 対象CIのサマリ（表示のみ、UXは崩さず最小）
-        _chat_target_id = ""
-        try:
-            if selected_incident_candidate:
-                _chat_target_id = selected_incident_candidate.get("id", "") or ""
-        except Exception:
-            _chat_target_id = ""
-        if not _chat_target_id:
-            _chat_target_id = target_device_id if 'target_device_id' in globals() else ""
-        _chat_ci = _build_ci_context_for_chat(_chat_target_id) if _chat_target_id else {}
-        if _chat_ci:
-            _vendor = _chat_ci.get("vendor", "") or "Unknown"
-            _os = _chat_ci.get("os", "") or "Unknown"
-            _model = _chat_ci.get("model", "") or "Unknown"
-            st.caption(f"対象機器: {_chat_target_id}   Vendor: {_vendor}   OS: {_os}   Model: {_model}")
-
-        # クイック質問（入力欄は変えず、コピペ用に提示）
-        q1, q2, q3 = st.columns(3)
-        if "chat_quick_text" not in st.session_state:
-            st.session_state.chat_quick_text = ""
-
-        with q1:
-            if st.button("設定バックアップ", use_container_width=True):
-                st.session_state.chat_quick_text = "この機器で、現在の設定を安全にバックアップする手順とコマンド例を教えてください。"
-        with q2:
-            if st.button("ロールバック", use_container_width=True):
-                st.session_state.chat_quick_text = "この機器で、変更をロールバックする代表的な手順（候補）と注意点を教えてください。"
-        with q3:
-            if st.button("確認コマンド", use_container_width=True):
-                st.session_state.chat_quick_text = "今回の症状を切り分けるために、まず実行すべき確認コマンド（show/diagnostic）を優先度順に教えてください。"
-
-        if st.session_state.chat_quick_text:
-            st.info("クイック質問（コピーして貼り付け）")
-            st.code(st.session_state.chat_quick_text)
-
         if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it")
@@ -847,45 +748,12 @@ with col_chat:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         res_container = st.empty()
-                        # CI-aware prompt（CI/Config をフル活用）
-                        target_id = ""
-                        try:
-                            if selected_incident_candidate:
-                                target_id = selected_incident_candidate.get("id", "") or ""
-                        except Exception:
-                            target_id = ""
-                        if not target_id:
-                            try:
-                                target_id = target_device_id
-                            except Exception:
-                                target_id = ""
-                        ci = _build_ci_context_for_chat(target_id) if target_id else {}
-                        ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
-次の CI 情報と Config 抜粋を必ず参照して、具体的に回答してください。一般論だけで終わらせないでください。
-
-【CI (JSON)】
-{json.dumps(ci, ensure_ascii=False, indent=2)}
-
-【ユーザーの質問】
-{prompt}
-
-回答ルール:
-- CI/Config に基づく具体手順・コマンド例を提示する
-- 追加確認が必要なら、質問は最小限（1〜2点）に絞る
-- 不明な前提は推測せず「CIに無いので確認が必要」と明記する
-"""
-
-                        response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=True)
+                        response = generate_content_with_retry(st.session_state.chat_session.model, prompt, stream=True)
                         if response:
                             full_response = ""
                             for chunk in response:
-                                piece = _safe_chunk_text(chunk)
-                                if not piece:
-                                    continue
-                                full_response += piece
+                                full_response += chunk.text
                                 res_container.markdown(full_response)
-                            if not full_response.strip():
-                                full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
                             st.session_state.messages.append({"role": "assistant", "content": full_response})
                         else:
                             st.error("AIからの応答がありませんでした。")
@@ -896,3 +764,36 @@ if st.session_state.trigger_analysis and st.session_state.live_result:
         pass
     st.session_state.trigger_analysis = False
     st.rerun()
+
+
+def _extract_first_codeblock_after_heading(md_text: str, heading_keyword: str):
+    """Markdown本文から、指定キーワードを含む見出し以降の最初のコードブロックを返す。見つからなければ None。"""
+    if not md_text:
+        return None
+    lines = md_text.splitlines()
+    in_target_section = False
+    in_code = False
+    buf = []
+    for line in lines:
+        if line.strip().startswith("#"):
+            in_target_section = (heading_keyword in line)
+            in_code = False
+            buf = []
+            continue
+        if not in_target_section:
+            continue
+        if line.strip().startswith("```") and not in_code:
+            in_code = True
+            buf = []
+            continue
+        if line.strip().startswith("```") and in_code:
+            return "\n".join(buf).strip()
+        if in_code:
+            buf.append(line)
+    return None
+
+def _ensure_cmd_state():
+    if "recovery_commands" not in st.session_state:
+        st.session_state.recovery_commands = None
+    if "verification_commands" not in st.session_state:
+        st.session_state.verification_commands = None
