@@ -90,7 +90,7 @@ def generate_fake_log_by_ai(scenario_name, target_node, api_key):
 def generate_config_from_intent(target_node, current_config, intent_text, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
+    model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.2})
     
     vendor = target_node.metadata.get("vendor", "Unknown Vendor")
     os_type = target_node.metadata.get("os", "Unknown OS")
@@ -132,30 +132,30 @@ def generate_remediation_commands(scenario, analysis_result, target_node, api_ke
     model = genai.GenerativeModel("gemma-3-12b-it", generation_config={"temperature": 0.0})
     
     prompt = f"""
-    あなたは熟練したネットワークエンジニアです。
-    発生している障害に対して、オペレーターが実行すべき**「完全な復旧手順書」**を作成してください。
+    あなたは熟練したネットワーク運用者/エンジニアです。
+    以下の情報を使って、オペレーター向けの **Remediation（対処のみ）** を作成してください。
     
-    対象デバイス: {target_node.id} ({target_node.metadata.get('vendor')} {target_node.metadata.get('os')})
-    発生シナリオ: {scenario}
-    AI分析結果: {analysis_result}
+    【重要】原因分析の説明は不要です（AI Analyst Report 側で扱います）。
+    ただし、前提条件として暫定原因を1行だけ書くのは許可します。
     
-    【重要: 出力要件】
-    以下の3つのセクションを必ず含めてください。Markdown形式で出力すること。
-
-    ### 1. 物理・前提アクション (Physical Actions)
-    * 電源障害やケーブル断、FAN故障の場合、「交換手順」や「結線確認」を具体的に指示してください。
-    * 例：「故障した電源ユニット(PSU1)を交換してください」「LANケーブルを再結線してください」など。
-    * ソフトウェア設定のみで直る場合は「特になし」で構いません。
-
-    ### 2. 復旧コマンド (Recovery Config)
-    * 設定変更や再起動が必要な場合のコマンド。
-    * 物理交換だけで復旧する場合でも、念のためのインターフェースリセット手順などを記載してください。
-    * コマンドは Markdownのコードブロック(```) で囲んでください。
-
-    ### 3. 正常性確認コマンド (Verification Commands)
-    * 対応後に正常に戻ったかを確認するためのコマンド（showコマンドやpingなど）。
-    * 必ず3つ以上提示してください。
-    * コマンドは Markdownのコードブロック(```) で囲んでください。
+    【入力】
+    - 対象デバイス: {target_node.id} ({target_node.metadata.get("vendor")} {target_node.metadata.get("os")} {target_node.metadata.get("model", "")})
+    - 発生シナリオ: {scenario}
+    - 分析結果（AI Analyst Report からの要約/候補）:
+    {analysis_result}
+    
+    【出力】（です/ます調、運用者向け。顧客向け表現は禁止）
+    以下の見出しで、**実施手順と確認のみ** を出力してください。
+    
+    ### Remediation 手順（対処のみ）
+    1. 実施前提・注意点（停止判断など Safety-Critical は人が握る前提）
+    2. 設定バックアップ手順（可能なら複数案）
+    3. 復旧手順（段階ごと、コマンドは ```bash のコードブロック）
+    4. ロールバック手順（失敗時の戻し）
+    5. 正常性確認コマンド（```bash）と期待結果（合否判定キー）
+    
+    ※ コマンドは機器OSに合わせて現実的に。情報不足なら「不明」とせず、
+       入力データから推定できる範囲の最小セットを提示し、追加で必要な情報も最後に列挙してください。
     """
     
     try:
