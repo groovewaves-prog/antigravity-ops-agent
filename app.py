@@ -162,7 +162,7 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
     recovered_map = st.session_state.get("recovered_scenario_map") or {}
 
     if recovered_devices.get(device_id) and recovered_map.get(device_id) == selected_scenario:
-        # “復旧後”の疑似ログ（成功）
+        # "復旧後"の疑似ログ（成功）
         if "FW" in selected_scenario:
             lines += [
                 "show chassis cluster status",
@@ -202,7 +202,7 @@ def run_diagnostic_simulation_no_llm(selected_scenario, target_node_obj):
             "device_id": device_id,
         }
 
-    # “障害中”の疑似ログ（現状維持）
+    # "障害中"の疑似ログ（現状維持）
     if "WAN全回線断" in selected_scenario or "[WAN]" in selected_scenario:
         lines += [
             "show ip interface brief",
@@ -795,7 +795,7 @@ with col_chat:
             誤操作防止のため、スコアが 60 以上の時のみ自動修復ボタンが有効化されます。
             """)
 
-    # チャット (常時表示)
+    # チャット (常時表示) - オプション3で改善
     with st.expander("💬 Chat with AI Agent", expanded=False):
         # 対象CIのサマリ（表示のみ、UXは崩さず最小）
         _chat_target_id = ""
@@ -837,30 +837,54 @@ with col_chat:
             model = genai.GenerativeModel("gemma-3-12b-it")
             st.session_state.chat_session = model.start_chat(history=[])
 
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]): st.markdown(msg["content"])
-
-        if prompt := st.chat_input("Ask details..."):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"): st.markdown(prompt)
-            if st.session_state.chat_session:
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        res_container = st.empty()
-                        # CI-aware prompt（CI/Config をフル活用）
+        # タブでレイアウトを整理
+        tab1, tab2 = st.tabs(["💬 会話", "📝 履歴"])
+        
+        with tab1:
+            # 最新の応答のみを目立たせる
+            if st.session_state.messages:
+                last_msg = st.session_state.messages[-1]
+                if last_msg["role"] == "assistant":
+                    st.info("🤖 最新の回答")
+                    with st.container(height=300):
+                        st.markdown(last_msg["content"])
+            
+            # 入力欄を上部に配置
+            st.markdown("---")
+            prompt = st.text_area(
+                "質問を入力してください:",
+                height=70,
+                placeholder="Ctrl+Enter または 送信ボタンで送信",
+                key="chat_textarea"
+            )
+            
+            col1, col2, col3 = st.columns([3, 1, 1])
+            with col2:
+                send_button = st.button("送信", type="primary", use_container_width=True)
+            with col3:
+                if st.button("クリア"):
+                    st.session_state.messages = []
+                    st.rerun()
+            
+            # 送信処理
+            if send_button and prompt:
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                
+                if st.session_state.chat_session:
+                    # CI-aware prompt（CI/Config をフル活用）
+                    target_id = ""
+                    try:
+                        if selected_incident_candidate:
+                            target_id = selected_incident_candidate.get("id", "") or ""
+                    except Exception:
                         target_id = ""
+                    if not target_id:
                         try:
-                            if selected_incident_candidate:
-                                target_id = selected_incident_candidate.get("id", "") or ""
+                            target_id = target_device_id
                         except Exception:
                             target_id = ""
-                        if not target_id:
-                            try:
-                                target_id = target_device_id
-                            except Exception:
-                                target_id = ""
-                        ci = _build_ci_context_for_chat(target_id) if target_id else {}
-                        ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
+                    ci = _build_ci_context_for_chat(target_id) if target_id else {}
+                    ci_prompt = f"""あなたはネットワーク運用（NOC/SRE）の実務者です。
 次の CI 情報と Config 抜粋を必ず参照して、具体的に回答してください。一般論だけで終わらせないでください。
 
 【CI (JSON)】
@@ -874,21 +898,33 @@ with col_chat:
 - 追加確認が必要なら、質問は最小限（1〜2点）に絞る
 - 不明な前提は推測せず「CIに無いので確認が必要」と明記する
 """
-
-                        response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=True)
-                        if response:
-                            full_response = ""
-                            for chunk in response:
-                                piece = _safe_chunk_text(chunk)
-                                if not piece:
-                                    continue
-                                full_response += piece
-                                res_container.markdown(full_response)
-                            if not full_response.strip():
-                                full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
-                            st.session_state.messages.append({"role": "assistant", "content": full_response})
-                        else:
-                            st.error("AIからの応答がありませんでした。")
+                    
+                    with st.spinner("AI が回答を生成中..."):
+                        try:
+                            response = generate_content_with_retry(st.session_state.chat_session.model, ci_prompt, stream=False)
+                            if response:
+                                full_response = response.text if hasattr(response, "text") else str(response)
+                                if not full_response.strip():
+                                    full_response = "AI応答が空でした（CIは渡しましたが出力が生成されませんでした）。"
+                                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                            else:
+                                st.error("AIからの応答がありませんでした。")
+                        except Exception as e:
+                            st.error(f"エラーが発生しました: {e}")
+                    st.rerun()
+        
+        with tab2:
+            # スクロール可能な履歴表示
+            if st.session_state.messages:
+                history_container = st.container(height=400)
+                with history_container:
+                    for i, msg in enumerate(st.session_state.messages):
+                        icon = "🤖" if msg["role"] == "assistant" else "👤"
+                        with st.container(border=True):
+                            st.markdown(f"{icon} **{msg['role'].upper()}** (メッセージ {i+1})")
+                            st.markdown(msg["content"])
+            else:
+                st.info("会話履歴はまだありません。")
 
 # ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
