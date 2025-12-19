@@ -588,7 +588,9 @@ with col_map:
             else:
                 log_lines.append("CONFIG_SNIPPET: (not available)")
 
-            log_content = "
+            log_content = "\n".join(probe_lines)
+# patched
+# 
 ".join(log_lines)
 
             # 後段（レポート/修復プラン）に渡すために保持
