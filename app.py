@@ -890,10 +890,9 @@ with st.sidebar:
 
             # チャットセッション初期化
             if 'chat_session' not in st.session_state:
-                api_key = os.environ.get("GEMINI_API_KEY", "")
-                if api_key:
-                    model = _llm_model
-                    st.session_state.chat_session = model.start_chat(history=[])
+                # 修正: すでに作成済みの _llm_model を利用する
+                if _llm_model:
+                    st.session_state.chat_session = _llm_model.start_chat(history=[])
                 else:
                     st.session_state.chat_session = None
 
