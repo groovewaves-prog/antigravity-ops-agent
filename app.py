@@ -347,9 +347,9 @@ if "current_scenario" not in st.session_state:
     st.session_state.current_scenario = "正常稼働"
 
 # 変数初期化
-for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map"]:
+for key in ["live_result", "messages", "chat_session", "trigger_analysis", "verification_result", "generated_report", "verification_log", "last_report_cand_id", "logic_engine", "recovered_devices", "recovered_scenario_map", "balloons_shown"]:
     if key not in st.session_state:
-        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
+        st.session_state[key] = None if key != "messages" and key != "trigger_analysis" and key != "balloons_shown" else ([] if key == "messages" else False)
 
 
 # 復旧状態（デモ用）
@@ -376,6 +376,7 @@ if st.session_state.current_scenario != selected_scenario:
     st.session_state.generated_report = None
     st.session_state.verification_log = None 
     st.session_state.last_report_cand_id = None
+    st.session_state.balloons_shown = False  # バルーンフラグもリセット
     if "remediation_plan" in st.session_state: del st.session_state.remediation_plan
     st.rerun()
 
@@ -703,7 +704,9 @@ with col_chat:
 
                     st.session_state.generated_report = full_text
         else:
-            st.markdown(st.session_state.generated_report)
+            # 既存レポートをスクロール可能なコンテナで表示
+            with st.container(height=400, border=True):
+                st.markdown(st.session_state.generated_report)
             if st.button("🔄 レポート再作成"):
                 st.session_state.generated_report = None
                 st.rerun()
@@ -733,7 +736,8 @@ with col_chat:
                      st.rerun()
         
         if "remediation_plan" in st.session_state:
-            with st.container(border=True):
+            # Remediation planをスクロール可能なコンテナで表示
+            with st.container(height=300, border=True):
                 st.info("AI Generated Recovery Procedure")
                 st.markdown(st.session_state.remediation_plan)
             
@@ -776,7 +780,12 @@ with col_chat:
                     st.session_state.recovered_scenario_map = st.session_state.get("recovered_scenario_map") or {}
                     st.session_state.recovered_devices[target_device_id] = True
                     st.session_state.recovered_scenario_map[target_device_id] = selected_scenario
-                    st.balloons()
+                    
+                    # バルーンは一度だけ表示
+                    if not st.session_state.balloons_shown:
+                        st.balloons()
+                        st.session_state.balloons_shown = True
+                    
                     st.success("✅ System Recovered Successfully!")
                 else:
                     st.warning("⚠️ Verification indicates potential issues. Please check manually.")
@@ -785,6 +794,7 @@ with col_chat:
                     del st.session_state.remediation_plan
                     st.session_state.verification_log = None
                     st.session_state.current_scenario = "正常稼働"
+                    st.session_state.balloons_shown = False  # バルーンフラグもリセット
                     st.rerun()
     else:
         if selected_incident_candidate:
@@ -832,7 +842,7 @@ with col_chat:
             st.info("クイック質問（コピーして貼り付け）")
             st.code(st.session_state.chat_quick_text)
 
-        if st.session_state.chat_session is None and api_key and selected_scenario != "正常稼働":
+        if st.session_state.chat_session is None and api_key:
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemma-3-12b-it")
             st.session_state.chat_session = model.start_chat(history=[])
