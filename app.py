@@ -14,9 +14,12 @@ from logic import CausalInferenceEngine, Alarm, simulate_cascade_failure
 from network_ops import (
     run_diagnostic_simulation, 
     generate_remediation_commands, 
-    generate_analyst_report,  # ★新規追加: 原因分析専用関数
+    generate_analyst_report,
     predict_initial_symptoms, 
-    generate_fake_log_by_ai
+    generate_fake_log_by_ai,
+    run_remediation_parallel_v2,      # ★新規: 改善案C関数
+    RemediationEnvironment,            # ★新規: 実行環境enum
+    RemediationResult                  # ★新規: 結果クラス
 )
 from verifier import verify_log_content, format_verification_report
 from inference_engine import LogicalRCA
@@ -763,18 +766,48 @@ with col_chat:
                         st.error("API Key Required")
                     else:
                         with st.status("Autonomic Remediation in progress...", expanded=True) as status:
-                            st.write("⚙️ Applying Configuration...")
-                            time.sleep(1.5) 
-                            
-                            st.write("🔎 Running Verification Commands...")
                             target_node_obj = TOPOLOGY.get(selected_incident_candidate["id"])
-                            verification_log = generate_fake_log_by_ai("正常稼働", target_node_obj, api_key)
-                            st.session_state.verification_log = verification_log
+                            device_info = target_node_obj.metadata if target_node_obj else {}
                             
-                            st.write("✅ Verification Completed.")
-                            status.update(label="Process Finished", state="complete", expanded=False)
+                            # ★改善案C: 並列実行（実運用対応版）
+                            st.write("🔄 Executing remediation steps in parallel...")
+                            
+                            results = run_remediation_parallel_v2(
+                                device_id=selected_incident_candidate["id"],
+                                device_info=device_info,
+                                scenario=selected_scenario,
+                                environment=RemediationEnvironment.DEMO,  # 本番はPROD
+                                timeout_per_step=30
+                            )
+                            
+                            # 結果を表示
+                            st.write("📋 Remediation steps result:")
+                            
+                            all_success = True
+                            remediation_summary = []
+                            
+                            for step_name in ["Backup", "Apply", "Verify"]:
+                                result = results.get(step_name)
+                                if result:
+                                    st.write(str(result))
+                                    remediation_summary.append(str(result))
+                                    if result.status != "success":
+                                        all_success = False
+                            
+                            # 統合ログを作成
+                            verification_log = "\n".join(remediation_summary)
+                            st.session_state.verification_log = verification_log
+                            st.session_state.remediation_results = results
+                            
+                            if all_success:
+                                st.write("✅ All remediation steps completed successfully.")
+                                status.update(label="Process Finished", state="complete", expanded=False)
+                            else:
+                                st.write("⚠️ Some remediation steps failed. Please review.")
+                                status.update(label="Process Finished - With Errors", state="error", expanded=True)
                         
-                        st.success("Remediation Process Finished.")
+                        if all_success:
+                            st.success("Remediation Process Finished.")
 
             with col_exec2:
                  if st.button("キャンセル"):
