@@ -754,7 +754,7 @@ with col_chat:
         
         if "remediation_plan" in st.session_state:
             # Remediation planをスクロール可能なコンテナで表示
-            with st.container(height=400, border=True):
+            with st.container(height=300, border=True):
                 st.info("AI Generated Recovery Procedure（復旧手順）")
                 st.markdown(st.session_state.remediation_plan)
             
